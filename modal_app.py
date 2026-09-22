@@ -525,19 +525,46 @@ def finish_job(job_id:str)->None:
     except Exception as exc: print(f"Queue dispatch error: {exc}",file=sys.stderr)
 
 def execute_media_job(job_id:str,chat_id:int,name:str,sources:list[str],processor,filename:str,stage3:str)->None:
-    media_volume.reload(); job_dir,scratch=job_workspace(job_id); output=job_dir/filename; ui=LiveUI(chat_id,job_id,name); stop=start_abort_watch(job_id)
+    media_volume.reload()
+    job_dir,scratch=job_workspace(job_id)
+    output_dir=job_dir/"output"
+    output_dir.mkdir(parents=True,exist_ok=True)
+    output=output_dir/filename
+    ui=LiveUI(chat_id,job_id,name)
+    stop=start_abort_watch(job_id)
     try:
         ui.start()
         if len(sources)==2:
-            candidate=download_media(job_id,sources[0],scratch/"candidate",ui); ui.update(2,"🔍 Inspecting media & extracting reference audio...",25,force=True)
-            reference=download_media(job_id,sources[1],scratch/"reference",ui); reference_audio=extract_reference_audio(job_id,reference,scratch); ui.update(3,"🎛️ Analyzing Waveforms & Drift...",50,force=True); processor(reference_audio,candidate,output)
+            candidate=download_media(job_id,sources[0],scratch/"candidate",ui)
+            ui.update(2,"🔍 Inspecting media & extracting reference audio...",25,force=True)
+            reference=download_media(job_id,sources[1],scratch/"reference",ui)
+            reference_audio=extract_reference_audio(job_id,reference,scratch)
+            ui.update(3,"🎛️ Analyzing Waveforms & Drift...",50,force=True)
+            processor(reference_audio,candidate,output)
         else:
-            source=download_media(job_id,sources[0],scratch/"source",ui); ui.update(2,"🔍 Inspecting media...",25,force=True); ui.update(3,stage3,50,force=True); processor(source,output)
-        check_abort(job_id); verify_output(output); ui.update(4,"☁️ Uploading output to cloud hosts...",88,force=True); links=upload_output(output)
-        ui.final("✅ Process Completed!\n\n"+f"📄 File: {output.name}\n📦 Verification: PASS\n🔗 Download Links:\n"+format_links(links)); output.unlink(missing_ok=True)
-    except JobCancelled: cleanup_scratch(scratch); ui.final("🛑 Process Cancelled by User. Scratch disk scrubbed.")
-    except Exception as exc: ui.final(f"❌ {name} failed.\n\nJob: {job_id}\nError: {exc}")
-    finally: stop.set(); cleanup_scratch(scratch); clear_abort(job_id); commit_volume(job_id); finish_job(job_id)
+            source=download_media(job_id,sources[0],scratch/"source",ui)
+            ui.update(2,"🔍 Inspecting media...",25,force=True)
+            ui.update(3,stage3,50,force=True)
+            processor(source,output)
+        check_abort(job_id)
+        verify_output(output)
+        ui.update(4,"☁️ Uploading output to cloud hosts...",88,force=True)
+        links=upload_output(output)
+        if not links:
+            raise RuntimeError("Cloud upload returned no verified download links. Output retained at "+str(output))
+        ui.final("✅ Process Completed!\n\n"+f"📄 File: {output.name}\n📦 Verification: PASS\n🔗 Download Links:\n"+format_links(links))
+        output.unlink(missing_ok=True)
+    except JobCancelled:
+        cleanup_scratch(scratch)
+        ui.final("🛑 Process Cancelled by User. Scratch disk scrubbed.")
+    except Exception as exc:
+        ui.final(f"❌ {name} failed.\n\nJob: {job_id}\n⚠️ Output retained at: {output}\nError: {exc}")
+    finally:
+        stop.set()
+        cleanup_scratch(scratch)
+        clear_abort(job_id)
+        commit_volume(job_id)
+        finish_job(job_id)
 
 @app.function(image=base_image,volumes={str(DATA_DIR):media_volume},secrets=[telegram_secret,remote_secret],cpu=8,memory=32768,timeout=86400,max_containers=1)
 def process_sync_task(job_id:str,chat_id:int,candidate_url:str,audio_url:str):
