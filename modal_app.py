@@ -43,6 +43,7 @@ gpu_image = (
     base_image
     .pip_install(
         "torch>=2.6,<3",
+        "torchvision>=0.21,<1",
         "opencv-python-headless>=4.11,<5",
         "realesrgan>=0.3.0,<1",
         "basicsr>=1.4.2,<2",
