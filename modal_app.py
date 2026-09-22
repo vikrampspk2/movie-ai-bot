@@ -120,7 +120,10 @@ def menu_markup() -> dict[str, Any]:
     return {"keyboard":[["🔄 Audio Sync","📦 x265 Encode (3-5 GiB)"],["🎬 1080p Hybrid Remaster","👑 4K Theater Remaster"],["📊 Cluster Status","❌ Cancel / Reset"]],"resize_keyboard":True,"is_persistent":True}
 
 def cancel_markup(job_id: str) -> dict[str, Any]:
-    return {"inline_keyboard":[[{"text":"❌ Cancel Process","callback_data":f"abort_{job_id}"}]]}
+    return {"inline_keyboard":[[
+        {"text":"🔄 Refresh","callback_data":f"refresh_{job_id}"},
+        {"text":"❌ Cancel Process","callback_data":f"abort_{job_id}"}
+    ]]}
 
 def send_tg_message(chat_id:int,text:str,menu:bool=False,inline:dict[str,Any]|None=None)->int|None:
     p={"chat_id":chat_id,"text":text}
@@ -191,7 +194,7 @@ def abort_watch(job_id:str,stop:threading.Event):
         if abort_path(job_id).exists():kill_children();return
 def start_abort_watch(job_id:str):
     stop=threading.Event();threading.Thread(target=abort_watch,args=(job_id,stop),daemon=True).start();return stop
-def run_abortable(job_id:str,command:list[str],timeout:int=7200):
+def run_abortable(job_id:str,command:list[str],timeout:int=86400):
     check_abort(job_id);p=subprocess.Popen(command,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True);started=time.monotonic()
     while p.poll() is None:
         if abort_path(job_id).exists():p.kill();p.wait(timeout=5);raise JobCancelled("cancelled")
@@ -431,6 +434,60 @@ def extract_reference_audio(job_id:str,reference_path:Path,scratch_dir:Path)->Pa
     run_abortable(job_id,["ffmpeg","-y","-v","error","-i",str(reference_path),"-map",f"0:{best['index']}","-vn","-c:a","flac",str(out)])
     return out
 
+def studio_sync(job_id: str, reference_audio: Path, candidate_video: Path, output_path: Path) -> None:
+    """Lossless-layout audio replacement with mono acoustic alignment."""
+    check_abort(job_id)
+    analysis = DATA_DIR / "jobs" / job_id / "scratch"
+    candidate_mono = analysis / "candidate_mono.wav"
+    reference_mono = analysis / "reference_mono.wav"
+    run_abortable(job_id, ["ffmpeg","-y","-v","error","-i",str(candidate_video),"-vn","-ac","1","-ar","48000","-sample_fmt","s16","-af","highpass=f=300,lowpass=f=3400",str(candidate_mono)])
+    run_abortable(job_id, ["ffmpeg","-y","-v","error","-i",str(reference_audio),"-vn","-ac","1","-ar","48000","-sample_fmt","s16","-af","highpass=f=300,lowpass=f=3400",str(reference_mono)])
+    import numpy as np
+    from scipy import signal
+    import soundfile as sf
+    cand, _ = sf.read(candidate_mono, dtype="float32", always_2d=False)
+    ref, _ = sf.read(reference_mono, dtype="float32", always_2d=False)
+    if cand.ndim != 1: cand=cand.mean(axis=1)
+    if ref.ndim != 1: ref=ref.mean(axis=1)
+    rate=48000
+    stride=48
+    cand_ds=cand[::stride]
+    ref_ds=ref[::stride]
+    if len(cand_ds)<1000 or len(ref_ds)<1000:
+        raise RuntimeError("Insufficient audio for acoustic synchronization")
+    window=min(60*1000,len(cand_ds))
+    probe=cand_ds[:window]
+    probe=probe-np.mean(probe)
+    norm=np.linalg.norm(probe)+1e-9
+    corr=signal.correlate(ref_ds,probe,mode="valid",method="fft")
+    scale=np.convolve(ref_ds*ref_ds,np.ones(window,dtype=np.float32),mode="valid")
+    scores=corr/(np.sqrt(np.maximum(scale,1e-9))*norm)
+    best=int(np.argmax(scores))
+    offset=best*stride/rate
+    confidence=float(scores[best])
+    if confidence < 0.08:
+        raise RuntimeError(f"Acoustic sync confidence too low ({confidence:.3f})")
+    corrected=analysis/"aligned_reference.flac"
+    probe_info=run_abortable(job_id,["ffprobe","-v","error","-show_entries","format=duration","-of","default=nw=1:nk=1",str(candidate_video)],120)
+    try: duration=float(probe_info.stdout.strip())
+    except Exception: duration=0.0
+    if offset > 0.01:
+        run_abortable(job_id,["ffmpeg","-y","-v","error","-ss",f"{offset:.6f}","-i",str(reference_audio),"-map","0:a:0","-c:a","flac",str(corrected)])
+        source_audio=corrected
+    elif offset < -0.01:
+        pad=-offset
+        run_abortable(job_id,["ffmpeg","-y","-v","error","-i",str(reference_audio),"-map","0:a:0","-af",f"adelay={pad*1000:.3f}:all=1","-c:a","flac",str(corrected)])
+        source_audio=corrected
+    else:
+        source_audio=reference_audio
+    check_abort(job_id)
+    mux=["ffmpeg","-y","-v","error","-i",str(candidate_video),"-i",str(source_audio),"-map","0:v:0","-map","1:a:0","-c:v","copy","-c:a","copy","-map_metadata","0","-avoid_negative_ts","make_zero"]
+    if duration>0: mux += ["-t",f"{duration:.6f}"]
+    mux += [str(output_path)]
+    run_abortable(job_id,mux,86400)
+    verify_output(output_path)
+
+
 def run_ffmpeg_remaster(job_id: str, source_path: Path, output_path: Path, four_k: bool = False) -> None:
     if four_k:
         vf = "scale=3840:2160:flags=lanczos+accurate_rnd,hqdn3d=1.2:1.2:2.5:2.5,deband=range=20:blur=true:coupling=true,unsharp=5:5:0.65:5:5:0.0,colorbalance=gs=-0.025:gm=-0.01:gb=0.015:ms=-0.015:mm=0.00:mb=0.025:hs=-0.01:hm=0.00:hb=0.01,eq=saturation=1.16:contrast=1.07:brightness=0.01,noise=c1s=4:c1f=t,format=yuv420p10le"
@@ -438,7 +495,7 @@ def run_ffmpeg_remaster(job_id: str, source_path: Path, output_path: Path, four_
     else:
         vf = "scale=1920:1080:flags=lanczos+accurate_rnd,hqdn3d=1.5:1.5:3:3,deband=range=16:blur=true:coupling=true,unsharp=5:5:0.7:5:5:0.0,colorbalance=gs=-0.02:gm=-0.01:gb=0.01:ms=-0.01:mm=0.00:mb=0.02,eq=saturation=1.14:contrast=1.06:brightness=0.01,noise=c1s=3:c1f=t,format=yuv420p10le"
         crf = "18"
-    run_abortable(job_id, ["ffmpeg","-y","-v","error","-i",str(source_path),"-map","0:v:0","-map","0:a?","-map","0:s?","-vf",vf,"-c:v","libx265","-crf",crf,"-preset","medium","-pix_fmt","yuv420p10le","-fps_mode","cfr","-c:a","copy","-c:s","copy","-max_muxing_queue_size","4096","-map_metadata","0",str(output_path)], 7200)
+    run_abortable(job_id, ["ffmpeg","-y","-v","error","-i",str(source_path),"-map","0:v:0","-map","0:a?","-map","0:s?","-vf",vf,"-c:v","libx265","-crf",crf,"-preset","medium","-pix_fmt","yuv420p10le","-fps_mode","cfr","-c:a","copy","-c:s","copy","-max_muxing_queue_size","4096","-map_metadata","0",str(output_path)], 86400)
 
 def run_encode_worker(job_id: str, chat_id: int, source_url: str) -> None:
     process_encode_task(job_id, chat_id, source_url)
@@ -567,8 +624,7 @@ def execute_media_job(job_id:str,chat_id:int,name:str,sources:list[str],processo
 
 @app.function(image=base_image,volumes={str(DATA_DIR):media_volume},secrets=[telegram_secret,remote_secret],cpu=8,memory=32768,timeout=86400,max_containers=1)
 def process_sync_task(job_id:str,chat_id:int,candidate_url:str,audio_url:str):
-    from app.sync.engine import sync_and_verify
-    execute_media_job(job_id,chat_id,"Audio Sync",[candidate_url,audio_url],lambda ref,cand,out:sync_and_verify(ref,cand,out),"Sync by Vikky.mkv","🎛️ Waveform Sync / Dynamic Drift Correction...")
+    execute_media_job(job_id,chat_id,"Audio Sync",[candidate_url,audio_url],lambda ref,cand,out:studio_sync(job_id,ref,cand,out),"Sync by Vikky.mkv","🎛️ 60s Sliding Acoustic Correlation / Dynamic Timeline Alignment...")
 
 @app.function(image=base_image,volumes={str(DATA_DIR):media_volume},secrets=[telegram_secret,remote_secret],cpu=8,memory=32768,timeout=86400,max_containers=1)
 def process_encode_task(job_id:str,chat_id:int,source_url:str):
