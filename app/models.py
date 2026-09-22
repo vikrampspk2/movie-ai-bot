@@ -39,6 +39,7 @@ class Job:
     audio_layout: str | None = None
     output_path: Path | None = None
     owner_id: int | None = None
+    upload_links: dict[str, str] = field(default_factory=dict)
 
     @property
     def elapsed_seconds(self) -> float:
