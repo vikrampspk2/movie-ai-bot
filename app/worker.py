@@ -9,6 +9,9 @@ from .sync.engine import sync_and_verify
 from .encode import encode_to_mkv
 from .upscale import upscale_4k
 from .uploaders import upload_to_all
+from .persistence import JobStore
+from .config import settings
+store = JobStore(settings.workspace_root)
 log = logging.getLogger("vikky-worker")
 
 async def _retry(fn, attempts: int = 3):
@@ -47,6 +50,7 @@ async def _sync_job(job: Job, bot: Bot) -> None:
 
 async def process_job(job: Job, bot: Bot) -> None:
     job.status, job.backend = JobStatus.RUNNING, "cpu"
+    store.save(job)
     try:
         if job.type == JobType.SYNC:
             await _sync_job(job, bot)
@@ -81,10 +85,12 @@ async def process_job(job: Job, bot: Bot) -> None:
         else:
             raise NotImplementedError(f"{job.type.value} worker is not enabled yet")
         job.status, job.stage = JobStatus.SUCCEEDED, "completed"
+        store.save(job)
     except asyncio.CancelledError:
         job.status, job.stage = JobStatus.CANCELLED, "cancelled"; raise
     except Exception as exc:
         job.status, job.stage, job.error = JobStatus.FAILED, "failed", str(exc)
+        store.save(job)
         log.exception("Job %s failed", job.id)
 
 async def worker_loop(bot: Bot) -> None:
