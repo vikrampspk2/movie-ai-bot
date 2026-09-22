@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import subprocess
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -38,10 +37,27 @@ def _duration(path: Path) -> float:
     return float(value)
 
 
-def _pcm(path: Path, sample_rate: int = 8000, channels: int = 1, seconds: float = 120.0) -> np.ndarray:
+def _audio_shape(path: Path) -> tuple[int, str | None]:
+    result = _run([
+        "ffprobe", "-v", "error", "-select_streams", "a:0",
+        "-show_entries", "stream=channels,channel_layout", "-of", "json", str(path)
+    ])
+    streams = json.loads(result.stdout).get("streams", [])
+    if not streams:
+        raise ValueError(f"No audio stream found: {path.name}")
+    stream = streams[0]
+    channels = int(stream.get("channels") or 0)
+    if channels < 1:
+        raise ValueError(f"Invalid audio channel count: {path.name}")
+    return channels, stream.get("channel_layout")
+
+
+def _pcm(path: Path, sample_rate: int, channels: int, seconds: float = 120.0) -> np.ndarray:
+    # No -ac downmix is used. FFmpeg outputs the native channel count in interleaved
+    # PCM; the analyzer reshapes it into [samples, channels] for per-channel matching.
     cmd = [
         "ffmpeg", "-v", "error", "-i", str(path), "-t", str(seconds),
-        "-vn", "-ac", str(channels), "-ar", str(sample_rate), "-f", "f32le", "pipe:1",
+        "-ar", str(sample_rate), "-f", "f32le", "pipe:1",
     ]
     try:
         raw = subprocess.run(cmd, capture_output=True, check=True, timeout=300).stdout
@@ -49,53 +65,68 @@ def _pcm(path: Path, sample_rate: int = 8000, channels: int = 1, seconds: float 
         raise RuntimeError("ffmpeg is required for PCM extraction") from exc
     except subprocess.CalledProcessError as exc:
         raise RuntimeError(exc.stderr.decode(errors="replace").strip() or "PCM extraction failed") from exc
-    return np.frombuffer(raw, dtype=np.float32)
+
+    values = np.frombuffer(raw, dtype=np.float32)
+    frames = values.size // channels
+    if frames < sample_rate * 2:
+        raise ValueError("Not enough audio for reliable synchronization")
+    return values[:frames * channels].reshape(frames, channels)
 
 
 def _normalize(x: np.ndarray) -> np.ndarray:
-    if x.size == 0:
-        return x
     x = x - np.mean(x)
     scale = np.sqrt(np.mean(x * x))
     return x / scale if scale > 1e-8 else x
 
 
-def estimate_offset(reference: np.ndarray, candidate: np.ndarray, sample_rate: int) -> tuple[float, float]:
-    """Estimate a constant offset using normalized FFT cross-correlation.
-
-    Positive offset means candidate audio is estimated to start later than reference.
-    Confidence is a bounded peak-to-runner-up ratio, not a guarantee of correctness.
-    """
-    n = min(reference.size, candidate.size)
-    if n < sample_rate * 2:
-        raise ValueError("Not enough audio for reliable synchronization")
-    # Use a bounded analysis window to keep CPU/memory predictable.
-    n = min(n, sample_rate * 120)
+def _channel_offset(reference: np.ndarray, candidate: np.ndarray, sample_rate: int) -> tuple[float, float]:
+    n = min(reference.size, candidate.size, sample_rate * 120)
     a = _normalize(reference[:n])
     b = _normalize(candidate[:n])
     size = 1 << int((2 * n - 1).bit_length())
-    corr = np.fft.irfft(np.fft.rfft(a, size) * np.conj(np.fft.rfft(b, size)), size)[: 2 * n - 1]
+    corr = np.fft.irfft(np.fft.rfft(a, size) * np.conj(np.fft.rfft(b, size)), size)[:2 * n - 1]
     corr = np.concatenate((corr[-(n - 1):], corr[:n]))
     abs_corr = np.abs(corr)
     peak = int(np.argmax(abs_corr))
     lag = peak - (n - 1)
     peak_value = float(abs_corr[peak])
     radius = max(1, sample_rate // 4)
-    lo, hi = max(0, peak - radius), min(abs_corr.size, peak + radius + 1)
     masked = abs_corr.copy()
-    masked[lo:hi] = 0
+    masked[max(0, peak - radius):min(abs_corr.size, peak + radius + 1)] = 0
     runner = float(np.max(masked))
     confidence = min(1.0, max(0.0, peak_value / (runner + 1e-9) - 1.0))
     return lag / sample_rate, confidence
 
 
+def estimate_offset(reference: np.ndarray, candidate: np.ndarray, sample_rate: int) -> tuple[float, float]:
+    if reference.ndim != 2 or candidate.ndim != 2:
+        raise ValueError("Audio arrays must be [samples, channels]")
+    if reference.shape[1] != candidate.shape[1]:
+        raise ValueError("Reference and candidate channel counts differ; refusing to downmix")
+    offsets = []
+    confidences = []
+    for channel in range(reference.shape[1]):
+        offset, confidence = _channel_offset(reference[:, channel], candidate[:, channel], sample_rate)
+        offsets.append(offset)
+        confidences.append(confidence)
+    median = float(np.median(offsets))
+    agreement = max(0.0, 1.0 - float(np.std(offsets)) / max(0.05, abs(median) + 0.05))
+    confidence = min(1.0, float(np.median(confidences)) * agreement)
+    return median, confidence
+
+
 def analyze(reference: Path, candidate: Path, sample_rate: int = 8000) -> SyncAnalysis:
     ref_duration = _duration(reference)
     cand_duration = _duration(candidate)
-    ref_pcm = _pcm(reference, sample_rate=sample_rate)
-    cand_pcm = _pcm(candidate, sample_rate=sample_rate)
+    ref_channels, ref_layout = _audio_shape(reference)
+    cand_channels, cand_layout = _audio_shape(candidate)
+    if ref_channels != cand_channels:
+        raise ValueError(f"Audio channel mismatch: reference={ref_channels}, candidate={cand_channels}")
+    ref_pcm = _pcm(reference, sample_rate, ref_channels)
+    cand_pcm = _pcm(candidate, sample_rate, cand_channels)
     offset, confidence = estimate_offset(ref_pcm, cand_pcm, sample_rate)
     drift = cand_duration - ref_duration
+    layout_note = ref_layout or f"{ref_channels}ch"
     return SyncAnalysis(
         reference_duration=ref_duration,
         candidate_duration=cand_duration,
@@ -103,6 +134,6 @@ def analyze(reference: Path, candidate: Path, sample_rate: int = 8000) -> SyncAn
         confidence=confidence,
         drift_seconds=drift,
         sample_rate=sample_rate,
-        channels=1,
-        method="PCM normalized FFT cross-correlation + duration drift check",
+        channels=ref_channels,
+        method=f"native-channel PCM FFT cross-correlation ({layout_note}) + duration drift check",
     )
