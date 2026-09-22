@@ -17,6 +17,9 @@ class JobQueue:
         self._lock = asyncio.Lock()
         self.store = store
 
+    def attach_store(self, store: JobStore) -> None:
+        self.store = store
+
     async def add(self, job: Job) -> Job:
         async with self._lock:
             self._jobs[job.id] = job
