@@ -6,6 +6,7 @@ from .media.probe import probe
 from .models import Job, JobStatus, JobType
 from .queue import queue
 from .sync.engine import sync_and_verify
+from .encode import encode_to_mkv
 from .uploaders import upload_to_all
 log = logging.getLogger("vikky-worker")
 
@@ -46,8 +47,24 @@ async def _sync_job(job: Job, bot: Bot) -> None:
 async def process_job(job: Job, bot: Bot) -> None:
     job.status, job.backend = JobStatus.RUNNING, "cpu"
     try:
-        if job.type == JobType.SYNC: await _sync_job(job, bot)
-        else: raise NotImplementedError(f"{job.type.value} worker is not enabled yet")
+        if job.type == JobType.SYNC:
+            await _sync_job(job, bot)
+        elif job.type == JobType.ENCODE:
+            if job.source_path is None: raise ValueError("ENCODE requires source media")
+            output = job.source_path.parent / "Vikky encoding.mkv"
+            job.stage, job.progress = "encoding", 10.0
+            result = await asyncio.to_thread(encode_to_mkv, job.source_path, output, 3.0, 5.0)
+            job.output_path, job.checkpoint, job.progress = result.output, str(result.output), 80.0
+            info = await asyncio.to_thread(probe, output)
+            job.media_info = {"size_bytes": result.actual_bytes, "codec": result.codec, "video_bitrate_kbps": result.video_bitrate_kbps, "container": info.container, "duration": info.duration}
+            job.verified = True
+            job.stage = "external_uploads"
+            job.upload_links = await upload_to_all(output)
+            job.stage = "telegram_upload"
+            if not await _telegram_upload(bot, job): raise RuntimeError("Telegram upload failed; verified output retained")
+            job.progress, job.stage = 100.0, "published"
+        else:
+            raise NotImplementedError(f"{job.type.value} worker is not enabled yet")
         job.status, job.stage = JobStatus.SUCCEEDED, "completed"
     except asyncio.CancelledError:
         job.status, job.stage = JobStatus.CANCELLED, "cancelled"; raise
