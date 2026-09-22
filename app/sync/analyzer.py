@@ -18,6 +18,16 @@ class SyncAnalysis:
     sample_rate: int
     channels: int
     method: str
+    reference_sample_rate: int
+    candidate_sample_rate: int
+    reference_channels: int
+    candidate_channels: int
+    reference_layout: str | None
+    candidate_layout: str | None
+    video_fps_reference: float | None
+    video_fps_candidate: float | None
+    vfr_reference: bool
+    vfr_candidate: bool
 
 
 def _run(cmd: list[str]) -> subprocess.CompletedProcess[str]:
@@ -37,10 +47,10 @@ def _duration(path: Path) -> float:
     return float(value)
 
 
-def _audio_shape(path: Path) -> tuple[int, str | None]:
+def _audio_shape(path: Path) -> tuple[int, str | None, int]:
     result = _run([
         "ffprobe", "-v", "error", "-select_streams", "a:0",
-        "-show_entries", "stream=channels,channel_layout", "-of", "json", str(path)
+        "-show_entries", "stream=channels,channel_layout,sample_rate", "-of", "json", str(path)
     ])
     streams = json.loads(result.stdout).get("streams", [])
     if not streams:
@@ -49,7 +59,7 @@ def _audio_shape(path: Path) -> tuple[int, str | None]:
     channels = int(stream.get("channels") or 0)
     if channels < 1:
         raise ValueError(f"Invalid audio channel count: {path.name}")
-    return channels, stream.get("channel_layout")
+    return channels, stream.get("channel_layout"), int(stream.get("sample_rate") or 0)
 
 
 def _pcm(path: Path, sample_rate: int, channels: int, seconds: float = 120.0) -> np.ndarray:
@@ -118,8 +128,8 @@ def estimate_offset(reference: np.ndarray, candidate: np.ndarray, sample_rate: i
 def analyze(reference: Path, candidate: Path, sample_rate: int = 8000) -> SyncAnalysis:
     ref_duration = _duration(reference)
     cand_duration = _duration(candidate)
-    ref_channels, ref_layout = _audio_shape(reference)
-    cand_channels, cand_layout = _audio_shape(candidate)
+    ref_channels, ref_layout, ref_rate = _audio_shape(reference)
+    cand_channels, cand_layout, cand_rate = _audio_shape(candidate)
     if ref_channels != cand_channels:
         raise ValueError(f"Audio channel mismatch: reference={ref_channels}, candidate={cand_channels}")
     ref_pcm = _pcm(reference, sample_rate, ref_channels)
@@ -135,5 +145,15 @@ def analyze(reference: Path, candidate: Path, sample_rate: int = 8000) -> SyncAn
         drift_seconds=drift,
         sample_rate=sample_rate,
         channels=ref_channels,
-        method=f"native-channel PCM FFT cross-correlation ({layout_note}) + duration drift check",
+        method=f"native-channel PCM FFT cross-correlation ({layout_note}) + duration drift check + source-rate/layout inspection",
+        reference_sample_rate=ref_rate,
+        candidate_sample_rate=cand_rate,
+        reference_channels=ref_channels,
+        candidate_channels=cand_channels,
+        reference_layout=ref_layout,
+        candidate_layout=cand_layout,
+        video_fps_reference=None,
+        video_fps_candidate=None,
+        vfr_reference=False,
+        vfr_candidate=False,
     )
