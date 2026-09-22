@@ -5,14 +5,13 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     app_env: str = "development"
     telegram_bot_token: str = ""
+    telegram_api_id: int | None = None
+    telegram_api_hash: str = ""
     bot_admin_id: int | None = None
     webhook_secret: str = ""
     workspace_root: Path = Path("./workspace")
     max_workspace_gb: float = 50.0
     default_queue_concurrency: int = 1
-    lightning_enabled: bool = False
-    lightning_endpoint: str = ""
-    lightning_api_key: str = ""
     modal_enabled: bool = False
     modal_endpoint: str = ""
     modal_api_key: str = ""
