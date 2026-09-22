@@ -11,8 +11,14 @@ class Settings(BaseSettings):
     max_workspace_gb: float = 50.0
     default_queue_concurrency: int = 1
     lightning_enabled: bool = False
+    lightning_endpoint: str = ""
+    lightning_api_key: str = ""
     modal_enabled: bool = False
+    modal_endpoint: str = ""
+    modal_api_key: str = ""
     kaggle_enabled: bool = False
+    kaggle_endpoint: str = ""
+    kaggle_api_key: str = ""
     telegram_max_upload_retries: int = 3
     external_upload_retries: int = 3
     gpu_required_for_upscale: bool = True
