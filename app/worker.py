@@ -6,22 +6,27 @@ from pathlib import Path
 
 from .models import Job, JobStatus, JobType
 from .queue import queue
+from .uploaders import upload_to_all
 from .sync.engine import SyncVerificationError, sync_and_verify
 
 log = logging.getLogger("vikky-worker")
 
 
 async def _sync_job(job: Job) -> None:
-    if job.source_path is None:
-        raise ValueError("SYNC job has no source file")
+    if job.source_path is None or job.reference_path is None:
+        raise ValueError("SYNC requires both reference and candidate media")
 
-    # Current single-file mode treats the supplied media as the candidate.
-    # A future two-source mode will use an explicit reference track/file.
     output = job.source_path.parent / "Sync by Vikky.mkv"
     job.stage = "sync_analyzing"
     job.progress = 10.0
-    await asyncio.to_thread(sync_and_verify, job.source_path, job.source_path, output)
+    verified = await asyncio.to_thread(sync_and_verify, job.reference_path, job.source_path, output)
     job.stage = "sync_verified"
+    job.progress = 70.0
+    job.checkpoint = str(output)
+    job.output_path = output
+    job.audio_layout = f"{verified.channels}ch"
+    job.stage = "uploading"
+    job.upload_links = await upload_to_all(output)
     job.progress = 100.0
     job.checkpoint = str(output)
 
