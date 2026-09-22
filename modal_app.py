@@ -8,7 +8,12 @@ import modal
 
 APP_NAME = os.getenv("MODAL_APP_NAME", "vikky-movie-ai")
 DATA_PATH = "/data"
+
 volume = modal.Volume.from_name("vikky-media", create_if_missing=True)
+remote_secret = modal.Secret.from_name(
+    "vikky-remote",
+    required_keys=["VIKKY_REMOTE_TOKEN"],
+)
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
@@ -24,6 +29,7 @@ app = modal.App(APP_NAME)
 
 @app.function(
     image=image,
+    secrets=[remote_secret],
     volumes={DATA_PATH: volume},
     min_containers=1,
     max_containers=2,
