@@ -125,6 +125,14 @@ def cancel_markup(job_id: str) -> dict[str, Any]:
         {"text":"❌ Cancel Process","callback_data":f"abort_{job_id}"}
     ]]}
 
+def delete_tg_message(chat_id:int,message_id:int|None)->None:
+    if not message_id:
+        return
+    try:
+        tg_api("deleteMessage",{"chat_id":chat_id,"message_id":message_id})
+    except Exception:
+        pass
+
 def send_tg_message(chat_id:int,text:str,menu:bool=False,inline:dict[str,Any]|None=None)->int|None:
     p={"chat_id":chat_id,"text":text}
     if menu:p["reply_markup"]=menu_markup()
@@ -733,20 +741,54 @@ async def telegram_webhook(request: Request) -> JSONResponse:
     prompts={"🔄 Audio Sync":("sync","📥 Step 1/2: Please send the Main Video Source (Candidate Video) direct link:"),"📦 x265 Encode (3-5 GiB)":("encode_x265","📥 Please send the Video direct link for High-Efficiency x265 Encoding (Target: 3-5 GiB):"),"🎬 1080p Hybrid Remaster":("remaster_1080p","📥 Please send the Video direct link to Remaster & Encode (1080p x265 15+ Filters):"),"👑 4K Theater Remaster":("remaster_4k","📥 Please send the Video direct link for 4K Theater Remastering (3840x2160 30+ Filters):")}
     if text in prompts:
         action,prompt=prompts[text]; dashboard_id=send_tg_message(chat_id,prompt,menu=True); set_user_state(chat_id,{"action":action,"step":"awaiting_video","dashboard_msg_id":dashboard_id}); return JSONResponse(status_code=200,content={"status":"awaiting_video"})
+    # Explicit state-machine gate: sync candidate URLs are never submitted as jobs.
     state=get_user_state(chat_id)
     if state:
-        if not is_valid_url(text): send_tg_message(chat_id,"❌ Please provide a valid HTTP/HTTPS direct media link.",menu=True); return JSONResponse(status_code=200,content={"status":"invalid_url"})
-        action,step=state.get("action"),state.get("step")
+        action=str(state.get("action") or "")
+        step=str(state.get("step") or "")
+        dashboard_id=state.get("dashboard_msg_id")
+
         if action=="sync" and step=="awaiting_video":
-            state["step"]="awaiting_audio"; state["candidate_url"]=text; set_user_state(chat_id,state); edit_tg_message(chat_id,state.get("dashboard_msg_id"),"🎵 Step 2/2: Now send the Audio Source direct link (or a Reference Video containing the audio):",cancel_markup("pending")); return JSONResponse(status_code=200,content={"status":"awaiting_audio"})
+            if not is_valid_url(text):
+                edit_tg_message(chat_id,dashboard_id,"❌ Invalid link. Please send a valid HTTP/HTTPS Candidate Video direct link.",cancel_markup("pending"))
+                return JSONResponse(status_code=200,content={"status":"awaiting_video","error":"invalid_url"})
+            set_user_state(chat_id,{"action":"sync","step":"awaiting_audio","candidate_url":text,"dashboard_msg_id":dashboard_id})
+            delete_tg_message(chat_id,int(msg.get("message_id") or 0))
+            edit_tg_message(chat_id,dashboard_id,"🎵 Step 2/2: Now send the Audio Source direct link (or a Reference Video containing the audio):",cancel_markup("pending"))
+            return JSONResponse(status_code=200,content={"status":"awaiting_audio"})
+
+        if not is_valid_url(text):
+            edit_tg_message(chat_id,dashboard_id,"❌ Invalid link. Please send a valid HTTP/HTTPS direct media link.",cancel_markup("pending"))
+            return JSONResponse(status_code=200,content={"status":step or "awaiting_video","error":"invalid_url"})
+
+        if action=="sync" and step=="awaiting_audio":
+            candidate_url=str(state.get("candidate_url") or "").strip()
+            reference_url=text
+            if not candidate_url or not is_valid_url(candidate_url):
+                clear_user_state(chat_id)
+                edit_tg_message(chat_id,dashboard_id,"❌ Candidate Video state is invalid. Please tap 🔄 Audio Sync and start again.",cancel_markup("pending"))
+                return JSONResponse(status_code=200,content={"status":"invalid_state"})
+            delete_tg_message(chat_id,int(msg.get("message_id") or 0))
+            clear_user_state(chat_id)
+            job_id,pos=submit_job(chat_id,"sync",[candidate_url,reference_url],dashboard_id)
+            status_text=("⏳ Task Added to Queue (Position: #"+str(pos)+")\nJob ID: "+job_id+
+                         "\nProcessing will automatically begin as soon as the active job completes.") if pos else "🎬 Audio Sync queued. Preparing the live dashboard…"
+            edit_tg_message(chat_id,dashboard_id,status_text,cancel_markup(job_id))
+            return JSONResponse(status_code=200,content={"status":"queued","job_id":job_id})
+
+        if action in {"encode_x265","remaster_1080p","remaster_4k"} and step=="awaiting_video":
+            delete_tg_message(chat_id,int(msg.get("message_id") or 0))
+            clear_user_state(chat_id)
+            job_id,pos=submit_job(chat_id,action,[text],dashboard_id)
+            status_text=("⏳ Task Added to Queue (Position: #"+str(pos)+")\nJob ID: "+job_id+
+                         "\nProcessing will automatically begin as soon as the active job completes.") if pos else "🎬 Task queued. Preparing the live dashboard…"
+            edit_tg_message(chat_id,dashboard_id,status_text,cancel_markup(job_id))
+            return JSONResponse(status_code=200,content={"status":"queued","job_id":job_id})
+
         clear_user_state(chat_id)
-        if action=="sync" and step=="awaiting_audio": job_id,pos=submit_job(chat_id,"sync",[str(state["candidate_url"]),text],state.get("dashboard_msg_id"))
-        elif action=="encode_x265" and step=="awaiting_video": job_id,pos=submit_job(chat_id,"encode_x265",[text],state.get("dashboard_msg_id"))
-        elif action=="remaster_1080p" and step=="awaiting_video": job_id,pos=submit_job(chat_id,"remaster_1080p",[text],state.get("dashboard_msg_id"))
-        elif action=="remaster_4k" and step=="awaiting_video": job_id,pos=submit_job(chat_id,"remaster_4k",[text],state.get("dashboard_msg_id"))
-        else: send_tg_message(chat_id,"❌ Invalid conversation state. Please start again.",menu=True); return JSONResponse(status_code=200,content={"status":"invalid_state"})
-        if pos: send_tg_message(chat_id,"⏳ Task Added to Queue (Position: #"+str(pos)+")\nJob ID: "+job_id+"\nProcessing will automatically begin as soon as the active job completes.",menu=True)
-        return JSONResponse(status_code=200,content={"status":"queued","job_id":job_id})
+        edit_tg_message(chat_id,dashboard_id,"❌ Invalid conversation state. Please start again.",cancel_markup("pending"))
+        return JSONResponse(status_code=200,content={"status":"invalid_state"})
+
     send_tg_message(chat_id,"Please choose an operation from the menu below.",menu=True); return JSONResponse(status_code=200,content={"status":"ignored"})
 
 
