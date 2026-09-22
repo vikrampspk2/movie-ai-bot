@@ -25,3 +25,20 @@ jobs:
 
       - name: Deploy
         run: modal deploy modal_app.py
+
+      - name: Configure Telegram webhook
+        run: |
+          python - <<'PY'
+          import modal
+          import urllib.request
+
+          fn = modal.Function.from_name("vikky-movie-ai", "api")
+          url = fn.get_web_url()
+          if not url:
+              raise SystemExit("Modal API web URL was not available after deployment")
+          setup_url = url.rstrip("/") + "/telegram/setup"
+          print("Configuring Telegram webhook:", setup_url)
+          with urllib.request.urlopen(setup_url, timeout=30) as response:
+              body = response.read().decode()
+              print(body)
+          PY
