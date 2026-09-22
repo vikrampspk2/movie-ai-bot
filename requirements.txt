@@ -6,7 +6,6 @@ httpx>=0.28,<1
 psutil>=6.1,<7
 pycdlib>=1.14,<2
 numpy>=2.2,<3
-aria2p>=0.12,<1
 torch>=2.6,<3
 realesrgan>=0.3.0,<1
 opencv-python-headless>=4.11,<5
