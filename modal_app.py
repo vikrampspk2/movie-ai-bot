@@ -156,25 +156,60 @@ def fmt_speed(bps:float)->str:
     return f"{v:.1f} {units[i]}"
 
 class LiveUI:
-    def __init__(self,chat_id:int,job_id:str,task:str):
-        self.chat_id=chat_id; self.job_id=job_id; self.task=task; self.message_id=None
+    def __init__(self, chat_id:int, job_id:str, task:str, message_id:int|None=None):
+        self.chat_id=chat_id; self.job_id=job_id; self.task=task; self.message_id=message_id
         self.started=time.monotonic(); self.last_edit=0.0; self.last_bytes=0; self.last_sample=self.started
-    def render(self,stage:int,status:str,percent:float,speed:float=0,eta:str="—")->str:
+
+    def render(self, stage:int, status:str, current_bytes:int=0, total_bytes:int|None=None,
+               speed:float=0.0, eta:str="—", percent:float|None=None) -> str:
+        elapsed=fmt_time(time.monotonic()-self.started)
+        mb=current_bytes/(1024**2)
+        if total_bytes and total_bytes>0 and percent is None:
+            percent=min(99.0,(current_bytes/total_bytes)*100.0)
+        if total_bytes and total_bytes>0 and percent is not None:
+            bar=progress_bar(percent)
+            return (f"🎬 Task: {self.task} (Job ID: {self.job_id})\n"
+                    f"Status: [{stage}/5] {status}\n"
+                    f"Progress: [{bar}] {percent:.0f}% ({mb:.1f} MB / {total_bytes/(1024**2):.1f} MB)\n"
+                    f"Speed: {fmt_speed(speed)} | Elapsed: {elapsed} | ETA: {eta}")
         return (f"🎬 Task: {self.task} (Job ID: {self.job_id})\n"
                 f"Status: [{stage}/5] {status}\n"
-                f"Progress: [{progress_bar(percent)}] {percent:.0f}%\n"
-                f"Speed: {fmt_speed(speed)} | Elapsed: {fmt_time(time.monotonic()-self.started)} | ETA: {eta}")
-    def start(self):
-        self.message_id=send_tg_message(self.chat_id,self.render(1,"📥 Downloading via turbo engine...",0),inline=cancel_markup(self.job_id))
-    def update(self,stage:int,status:str,percent:float,current_bytes:int=0,total_bytes:int|None=None,force:bool=False):
-        now=time.monotonic(); dt=now-self.last_sample
-        speed=(current_bytes-self.last_bytes)/dt if dt>0 and current_bytes>=self.last_bytes else 0
-        if current_bytes:self.last_bytes=current_bytes; self.last_sample=now
-        if not force and now-self.last_edit<3.2:return
+                f"Transferred: {mb:.2f} MB\n"
+                f"Speed: {fmt_speed(speed)} | Elapsed: {elapsed}")
+
+    def start(self, status:str="📥 Turbo Downloading Stream..."):
+        if self.message_id is None:
+            self.message_id=send_tg_message(self.chat_id,self.render(1,status),inline=cancel_markup(self.job_id))
+            self.last_edit=time.monotonic()
+
+    def update(self,stage:int,status:str,current_bytes:int=0,total_bytes:int|None=None,
+               force:bool=False,percent:float|None=None):
+        now=time.monotonic()
+        dt=now-self.last_sample
+        speed=(current_bytes-self.last_bytes)/dt if dt>0 and current_bytes>=self.last_bytes else 0.0
+        if current_bytes>=0:
+            self.last_bytes=current_bytes; self.last_sample=now
+        if not force and now-self.last_edit<3.5:
+            return
         eta="—"
-        if speed>0 and total_bytes and percent>0:eta=fmt_time((total_bytes-total_bytes*percent/100)/speed)
-        edit_tg_message(self.chat_id,self.message_id,self.render(stage,status,percent,speed,eta),cancel_markup(self.job_id)); self.last_edit=now
-    def final(self,text:str):edit_tg_message(self.chat_id,self.message_id,text,{"inline_keyboard":[]})
+        if speed>0 and total_bytes and total_bytes>current_bytes:
+            eta=fmt_time((total_bytes-current_bytes)/speed)
+        try:
+            if self.message_id is not None:
+                edit_tg_message(self.chat_id,self.message_id,
+                                self.render(stage,status,current_bytes,total_bytes,speed,eta,percent),
+                                cancel_markup(self.job_id))
+            self.last_edit=now
+        except Exception:
+            pass
+
+    def final(self,text:str):
+        try:
+            if self.message_id is not None:
+                edit_tg_message(self.chat_id,self.message_id,text,{"inline_keyboard":[]})
+        except Exception:
+            pass
+
 
 class JobCancelled(RuntimeError):pass
 def abort_path(job_id:str)->Path:return DATA_DIR/f"abort_{job_id}.flag"
@@ -402,15 +437,24 @@ def assert_not_html(path:Path):
     if b"<!doctype" in head or b"<html" in head:raise RuntimeError("❌ Error: Link returned an HTML web page instead of media. Please provide a direct download or stream link.")
 def aria2_download(job_id:str,url:str,destination:Path,ui:LiveUI|None=None)->Path:
     check_abort(job_id);destination.parent.mkdir(parents=True,exist_ok=True)
-    cmd=["aria2c","--allow-overwrite=true","--auto-file-renaming=false","--continue=true","-x","16","-s","16","-k","1M","-j","16","--max-connection-per-server=16","--split=16","--min-split-size=1M","--file-allocation=none","--summary-interval=3","--console-log-level=warn","--dir",str(destination.parent),"--out",destination.name,url]
-    p=subprocess.Popen(cmd,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,text=True);last=0;tick=time.monotonic()
+    total=None
+    try:
+        with httpx.Client(timeout=20,follow_redirects=True) as client:
+            h=client.head(url)
+            if h.status_code<400 and h.headers.get("content-length"):
+                total=int(h.headers["content-length"])
+    except Exception:
+        pass
+    cmd=["aria2c","--allow-overwrite=true","--auto-file-renaming=false","--continue=true","-x","16","-s","16","-k","1M","-j","16","--max-connection-per-server=16","--split=16","--min-split-size=1M","--file-allocation=none","--summary-interval=1","--console-log-level=warn","--dir",str(destination.parent),"--out",destination.name,url]
+    p=subprocess.Popen(cmd,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,text=True)
     try:
         while p.poll() is None:
-            check_abort(job_id);size=destination.stat().st_size if destination.exists() else 0;now=time.monotonic()
-            if ui:ui.update(1,"📥 Downloading via turbo engine...",min(18,4+size/(1024**3)*14),size)
-            last,tick=size,now;time.sleep(.8)
+            check_abort(job_id)
+            size=destination.stat().st_size if destination.exists() else 0
+            if ui: ui.update(1,"📥 Turbo Downloading Stream...",size,total)
+            time.sleep(0.8)
         err=p.stderr.read() if p.stderr else ""
-        if p.returncode:raise subprocess.CalledProcessError(p.returncode,cmd,stderr=err)
+        if p.returncode: raise subprocess.CalledProcessError(p.returncode,cmd,stderr=err)
     except JobCancelled:
         p.kill();p.wait(timeout=5);raise
     finally:
@@ -592,19 +636,19 @@ def execute_media_job(job_id:str,chat_id:int,name:str,sources:list[str],processo
         ui.start()
         if len(sources)==2:
             candidate=download_media(job_id,sources[0],scratch/"candidate",ui)
-            ui.update(2,"🔍 Inspecting media & extracting reference audio...",25,force=True)
+            ui.update(2,"🔍 Inspecting media & extracting reference audio...",0,force=True)
             reference=download_media(job_id,sources[1],scratch/"reference",ui)
             reference_audio=extract_reference_audio(job_id,reference,scratch)
-            ui.update(3,"🎛️ Analyzing Waveforms & Drift...",50,force=True)
+            ui.update(3,"🎛️ Analyzing Waveforms & Drift...",0,force=True)
             processor(reference_audio,candidate,output)
         else:
             source=download_media(job_id,sources[0],scratch/"source",ui)
-            ui.update(2,"🔍 Inspecting media...",25,force=True)
-            ui.update(3,stage3,50,force=True)
+            ui.update(2,"🔍 Inspecting media...",0,force=True)
+            ui.update(3,stage3,0,force=True)
             processor(source,output)
         check_abort(job_id)
         verify_output(output)
-        ui.update(4,"☁️ Uploading output to cloud hosts...",88,force=True)
+        ui.update(4,"☁️ Uploading output to cloud hosts...",0,force=True)
         links=upload_output(output)
         if not links:
             raise RuntimeError("Cloud upload returned no verified download links. Output retained at "+str(output))
@@ -636,8 +680,8 @@ def process_remaster_task(job_id:str,chat_id:int,source_url:str,four_k:bool=Fals
     name="4K Theater Remaster" if four_k else "1080p Hybrid Remaster"; filename="Vikky 4K Theater Remaster.mkv" if four_k else "Vikky Hybrid Remaster 1080p.mkv"
     execute_media_job(job_id,chat_id,name,[source_url],lambda source,out:run_ffmpeg_remaster(job_id,source,out,four_k),filename,"🎬 4K Theater Master / 30+ Filter Equivalent..." if four_k else "🎬 15+ Filter Hybrid Remaster...")
 
-def submit_job(chat_id:int,kind:str,args:list[str])->tuple[str,int]:
-    job_id=os.urandom(4).hex(); enqueue_job({"job_id":job_id,"chat_id":chat_id,"kind":kind,"args":args,"created_at":time.time()})
+def submit_job(chat_id:int,kind:str,args:list[str],dashboard_msg_id:int|None=None)->tuple[str,int]:
+    job_id=os.urandom(4).hex(); enqueue_job({"job_id":job_id,"chat_id":chat_id,"kind":kind,"args":args,"created_at":time.time(),"dashboard_msg_id":dashboard_msg_id})
     try: dispatch_next()
     except Exception as exc: print(f"Initial queue dispatch error: {exc}",file=sys.stderr)
     active=get_active_job(); return job_id,(0 if active and active.get("job_id")==job_id else queue_position(job_id))
@@ -661,7 +705,13 @@ async def telegram_webhook(request: Request) -> JSONResponse:
     callback=data.get("callback_query")
     if callback:
         cid=str(callback.get("id") or ""); payload=str(callback.get("data") or ""); msg=callback.get("message") or {}; chat_id=int((msg.get("chat") or {}).get("id") or 0)
-        if payload.startswith("abort_"):
+        if payload.startswith("refresh_"):
+            job_id=payload[8:]; active=get_active_job()
+            if active and active.get("job_id")==job_id:
+                answer_callback(cid,"Refreshed! ⚡")
+                return JSONResponse(status_code=200,content={"status":"refreshed"})
+            answer_callback(cid,"Job is not active")
+        elif payload.startswith("abort_"):
             job_id=payload[6:]; active=get_active_job()
             if active and active.get("job_id")==job_id:
                 request_abort(job_id); cleanup_scratch(JOBS_DIR/job_id/"scratch"); answer_callback(cid,"Cancellation requested"); edit_tg_message(chat_id,msg.get("message_id"),"🛑 Process Cancelled by User. Scratch disk scrubbed.",{"inline_keyboard":[]})
@@ -679,21 +729,21 @@ async def telegram_webhook(request: Request) -> JSONResponse:
         if active and int(active.get("chat_id",-1))==chat_id:request_abort(str(active["job_id"]))
         clear_user_state(chat_id); send_tg_message(chat_id,"🛑 Cancel / Reset requested. Conversation state cleared.",menu=True); return JSONResponse(status_code=200,content={"status":"ok"})
     if text=="📊 Cluster Status":
-        active=get_active_job(); pending=len(load_queue()); send_tg_message(chat_id,"🟢 Cluster Status: Online\n\nActive: "+str(active.get("job_id") if active else "None")+"\nPending FIFO: "+str(pending)+"\nWorkers: 8 CPU / 32 GB RAM / 7200s\nGPU: disabled\nStorage: /data\nConcurrency: 1",menu=True); return JSONResponse(status_code=200,content={"status":"ok"})
+        active=get_active_job(); pending=len(load_queue()); send_tg_message(chat_id,"🟢 Cluster Status: Online\n\nActive: "+str(active.get("job_id") if active else "None")+"\nPending FIFO: "+str(pending)+"\nWorkers: 8 CPU / 32 GB RAM / 86400s\nGPU: disabled\nStorage: /data\nConcurrency: 1",menu=True); return JSONResponse(status_code=200,content={"status":"ok"})
     prompts={"🔄 Audio Sync":("sync","📥 Step 1/2: Please send the Main Video Source (Candidate Video) direct link:"),"📦 x265 Encode (3-5 GiB)":("encode_x265","📥 Please send the Video direct link for High-Efficiency x265 Encoding (Target: 3-5 GiB):"),"🎬 1080p Hybrid Remaster":("remaster_1080p","📥 Please send the Video direct link to Remaster & Encode (1080p x265 15+ Filters):"),"👑 4K Theater Remaster":("remaster_4k","📥 Please send the Video direct link for 4K Theater Remastering (3840x2160 30+ Filters):")}
     if text in prompts:
-        action,prompt=prompts[text]; set_user_state(chat_id,{"action":action,"step":"awaiting_video"}); send_tg_message(chat_id,prompt,menu=True); return JSONResponse(status_code=200,content={"status":"awaiting_video"})
+        action,prompt=prompts[text]; dashboard_id=send_tg_message(chat_id,prompt,menu=True); set_user_state(chat_id,{"action":action,"step":"awaiting_video","dashboard_msg_id":dashboard_id}); return JSONResponse(status_code=200,content={"status":"awaiting_video"})
     state=get_user_state(chat_id)
     if state:
         if not is_valid_url(text): send_tg_message(chat_id,"❌ Please provide a valid HTTP/HTTPS direct media link.",menu=True); return JSONResponse(status_code=200,content={"status":"invalid_url"})
         action,step=state.get("action"),state.get("step")
         if action=="sync" and step=="awaiting_video":
-            set_user_state(chat_id,{"action":"sync","step":"awaiting_audio","candidate_url":text}); send_tg_message(chat_id,"🎵 Step 2/2: Now send the Audio Source direct link (or a Reference Video containing the audio):",menu=True); return JSONResponse(status_code=200,content={"status":"awaiting_audio"})
+            state["step"]="awaiting_audio"; state["candidate_url"]=text; set_user_state(chat_id,state); edit_tg_message(chat_id,state.get("dashboard_msg_id"),"🎵 Step 2/2: Now send the Audio Source direct link (or a Reference Video containing the audio):",cancel_markup("pending")); return JSONResponse(status_code=200,content={"status":"awaiting_audio"})
         clear_user_state(chat_id)
-        if action=="sync" and step=="awaiting_audio": job_id,pos=submit_job(chat_id,"sync",[str(state["candidate_url"]),text])
-        elif action=="encode_x265" and step=="awaiting_video": job_id,pos=submit_job(chat_id,"encode_x265",[text])
-        elif action=="remaster_1080p" and step=="awaiting_video": job_id,pos=submit_job(chat_id,"remaster_1080p",[text])
-        elif action=="remaster_4k" and step=="awaiting_video": job_id,pos=submit_job(chat_id,"remaster_4k",[text])
+        if action=="sync" and step=="awaiting_audio": job_id,pos=submit_job(chat_id,"sync",[str(state["candidate_url"]),text],state.get("dashboard_msg_id"))
+        elif action=="encode_x265" and step=="awaiting_video": job_id,pos=submit_job(chat_id,"encode_x265",[text],state.get("dashboard_msg_id"))
+        elif action=="remaster_1080p" and step=="awaiting_video": job_id,pos=submit_job(chat_id,"remaster_1080p",[text],state.get("dashboard_msg_id"))
+        elif action=="remaster_4k" and step=="awaiting_video": job_id,pos=submit_job(chat_id,"remaster_4k",[text],state.get("dashboard_msg_id"))
         else: send_tg_message(chat_id,"❌ Invalid conversation state. Please start again.",menu=True); return JSONResponse(status_code=200,content={"status":"invalid_state"})
         if pos: send_tg_message(chat_id,"⏳ Task Added to Queue (Position: #"+str(pos)+")\nJob ID: "+job_id+"\nProcessing will automatically begin as soon as the active job completes.",menu=True)
         return JSONResponse(status_code=200,content={"status":"queued","job_id":job_id})
