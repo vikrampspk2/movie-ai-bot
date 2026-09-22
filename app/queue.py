@@ -1,14 +1,14 @@
+from __future__ import annotations
+
 import asyncio
 from collections import deque
+from pathlib import Path
 
 from .models import Job, JobStatus
 
 
 class JobQueue:
-    """Small in-process queue for the first foundation stage.
-
-    Persistent queue/checkpoint storage will be added before production deployment.
-    """
+    """Async in-memory queue with bounded concurrency for the bot process."""
 
     def __init__(self) -> None:
         self._jobs: dict[str, Job] = {}
@@ -28,10 +28,17 @@ class JobQueue:
     async def next(self) -> Job | None:
         async with self._lock:
             while self._pending:
-                job = self._jobs[self._pending.popleft()]
-                if job.status == JobStatus.QUEUED:
+                job_id = self._pending.popleft()
+                job = self._jobs.get(job_id)
+                if job and job.status == JobStatus.QUEUED:
                     return job
             return None
+
+    async def requeue(self, job_id: str) -> None:
+        async with self._lock:
+            job = self._jobs.get(job_id)
+            if job and job.status == JobStatus.QUEUED:
+                self._pending.append(job_id)
 
     async def cancel(self, job_id: str) -> bool:
         async with self._lock:
