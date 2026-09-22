@@ -62,16 +62,21 @@ gpu_image = (
         "libglib2.0-0",
     )
     .pip_install(
-        "torch>=2.2,<3",
-        "torchvision>=0.17,<1",
-        "torchaudio>=2.2,<3",
+        "torch==2.1.2",
+        "torchvision==0.16.2",
+        "torchaudio==2.1.2",
+    )
+    .pip_install(
         "opencv-python-headless>=4.9,<5",
-        "realesrgan>=0.3,<1",
-        "basicsr>=1.4.2,<2",
+        "numpy>=1.24,<3",
         "fastapi[standard]>=0.115,<1",
         "httpx>=0.28,<1",
-        "numpy>=1.24,<3",
         "psutil>=5.9,<8",
+    )
+    .pip_install(
+        "basicsr>=1.4.2,<2",
+        "realesrgan>=0.3,<1",
+        extra_options="--no-build-isolation",
     )
     .add_local_python_source("app")
 )
