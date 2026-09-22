@@ -42,6 +42,17 @@ def apply_sync(video: Path, analysis: SyncAnalysis, output: Path) -> None:
     """
     offset = analysis.estimated_offset_seconds
     streams = _probe_audio_layout(video)
+    if analysis.reference_sample_rate < 1 or analysis.candidate_sample_rate < 1:
+        raise SyncVerificationError("Invalid source sample rate")
+    if len(analysis.segment_offsets) >= 2:
+        first, last = analysis.segment_offsets[0], analysis.segment_offsets[-1]
+        span = max(1.0, analysis.reference_duration)
+        drift_rate = (last - first) / span
+    else:
+        drift_rate = 0.0
+    if abs(drift_rate) > 0.02:
+        raise SyncVerificationError("Measured audio drift exceeds safe automatic correction limits")
+    atempo = max(0.5, min(2.0, 1.0 + drift_rate))
     if not streams:
         raise SyncVerificationError("No audio stream found")
     source_layouts = [(s.get("channels"), s.get("channel_layout"), s.get("sample_rate")) for s in streams]
@@ -59,11 +70,17 @@ def apply_sync(video: Path, analysis: SyncAnalysis, output: Path) -> None:
     maps = []
     for i, _stream in enumerate(streams):
         label = f"a{i}"
+        chain = []
+        if abs(atempo - 1.0) > 0.00001:
+            chain.append(f"atempo={atempo:.9f}")
         if offset > 0:
-            filters.append(f"[0:a:{i}]asetpts=PTS-{offset}/TB[{label}]")
+            chain.append(f"asetpts=PTS-{offset}/TB")
         else:
             delay_ms = max(0, int(round(-offset * 1000)))
-            filters.append(f"[0:a:{i}]adelay={delay_ms}:all=1[{label}]")
+            chain.append(f"adelay={delay_ms}:all=1")
+        if analysis.candidate_sample_rate != analysis.reference_sample_rate:
+            chain.append(f"aresample={analysis.reference_sample_rate}")
+        filters.append(f"[0:a:{i}]{','.join(chain)}[{label}]")
         maps.append(f"-map"); maps.append(f"[{label}]")
     filter_expr = ";".join(filters)
 
@@ -88,10 +105,12 @@ def apply_sync(video: Path, analysis: SyncAnalysis, output: Path) -> None:
 
 def sync_and_verify(reference: Path, candidate: Path, output: Path) -> SyncAnalysis:
     analysis = analyze(reference, candidate)
+    if analysis.reference_layout and analysis.candidate_layout and analysis.reference_layout != analysis.candidate_layout:
+        raise SyncVerificationError(f"Audio layout mismatch: reference={analysis.reference_layout}, candidate={analysis.candidate_layout}")
     if analysis.confidence < 0.10:
         raise SyncVerificationError("Synchronization confidence is too low for automatic correction")
-    if abs(analysis.drift_seconds) > 0.5:
-        raise SyncVerificationError("Duration drift is too large for constant-offset correction")
+    if abs(analysis.drift_seconds) > max(0.5, analysis.reference_duration * 0.02):
+        raise SyncVerificationError("Duration drift is too large for safe automatic correction")
 
     apply_sync(candidate, analysis, output)
     verified = analyze(reference, output)
