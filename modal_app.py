@@ -117,7 +117,7 @@ def tg_api(method: str, payload: dict[str, Any]) -> dict[str, Any]:
     return data
 
 def menu_markup() -> dict[str, Any]:
-    return {"keyboard":[["🔄 Audio Sync","🎬 Hybrid Remaster (1080p)"],["🧠 4K AI Upscale","📊 Cluster Status"],["❌ Cancel / Reset"]],"resize_keyboard":True,"is_persistent":True}
+    return {"keyboard":[["🔄 Audio Sync","📦 x265 Encode (3-5 GiB)"],["🎬 1080p Hybrid Remaster","👑 4K Theater Remaster"],["📊 Cluster Status","❌ Cancel / Reset"]],"resize_keyboard":True,"is_persistent":True}
 
 def cancel_markup(job_id: str) -> dict[str, Any]:
     return {"inline_keyboard":[[{"text":"❌ Cancel Process","callback_data":f"abort_{job_id}"}]]}
@@ -419,9 +419,14 @@ def extract_reference_audio(job_id:str,reference_path:Path,scratch_dir:Path)->Pa
     run_abortable(job_id,["ffmpeg","-y","-v","error","-i",str(reference_path),"-map",f"0:{best['index']}","-vn","-c:a","flac",str(out)])
     return out
 
-def run_ffmpeg_remaster(job_id:str,source_path:Path,output_path:Path)->None:
-    vf="scale=1920:1080:flags=lanczos,deband=1:64:16:16,unsharp=5:5:0.8:5:5:0.0,eq=saturation=1.15:contrast=1.05:brightness=0.01,format=yuv420p10le"
-    run_abortable(job_id,["ffmpeg","-y","-v","error","-i",str(source_path),"-map","0:v:0","-map","0:a?","-map","0:s?","-vf",vf,"-c:v","libx265","-crf","19","-preset","medium","-pix_fmt","yuv420p10le","-fps_mode","cfr","-c:a","copy","-c:s","copy","-max_muxing_queue_size","4096",str(output_path)])
+def run_ffmpeg_remaster(job_id: str, source_path: Path, output_path: Path, four_k: bool = False) -> None:
+    if four_k:
+        vf = "scale=3840:2160:flags=lanczos+accurate_rnd,hqdn3d=1.2:1.2:2.5:2.5,deband=range=20:blur=true:coupling=true,unsharp=5:5:0.65:5:5:0.0,colorbalance=gs=-0.025:gm=-0.01:gb=0.015:ms=-0.015:mm=0.00:mb=0.025:hs=-0.01:hm=0.00:hb=0.01,eq=saturation=1.16:contrast=1.07:brightness=0.01,noise=c1s=4:c1f=t,format=yuv420p10le"
+        crf = "17"
+    else:
+        vf = "scale=1920:1080:flags=lanczos+accurate_rnd,hqdn3d=1.5:1.5:3:3,deband=range=16:blur=true:coupling=true,unsharp=5:5:0.7:5:5:0.0,colorbalance=gs=-0.02:gm=-0.01:gb=0.01:ms=-0.01:mm=0.00:mb=0.02,eq=saturation=1.14:contrast=1.06:brightness=0.01,noise=c1s=3:c1f=t,format=yuv420p10le"
+        crf = "18"
+    run_abortable(job_id, ["ffmpeg","-y","-v","error","-i",str(source_path),"-map","0:v:0","-map","0:a?","-map","0:s?","-vf",vf,"-c:v","libx265","-crf",crf,"-preset","medium","-pix_fmt","yuv420p10le","-fps_mode","cfr","-c:a","copy","-c:s","copy","-max_muxing_queue_size","4096","-map_metadata","0",str(output_path)], 7200)
 
 def run_encode_worker(job_id: str, chat_id: int, source_url: str) -> None:
     process_encode_task(job_id, chat_id, source_url)
