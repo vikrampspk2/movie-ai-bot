@@ -4,3 +4,4 @@ uvicorn[standard]>=0.34,<1
 pydantic-settings>=2.7,<3
 httpx>=0.28,<1
 psutil>=6.1,<7
+pycdlib>=1.14,<2
