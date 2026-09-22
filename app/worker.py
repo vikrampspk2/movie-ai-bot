@@ -15,6 +15,7 @@ from .queue import queue
 from .sync.engine import sync_and_verify
 from .upscale import upscale_4k
 from .uploaders import upload_to_all
+from .cleanup import cleanup_workspace
 
 store = JobStore(settings.workspace_root)
 log = logging.getLogger("vikky-worker")
@@ -66,6 +67,7 @@ async def _sync_job(job: Job, bot: Bot) -> None:
         raise RuntimeError("Telegram upload failed; verified output retained")
     await asyncio.to_thread(probe, output)
     job.progress, job.stage = 100.0, "published"
+    cleanup_workspace(output.parent, output, keep_output=True)
 
 
 async def _local_job(job: Job, bot: Bot) -> None:
@@ -109,6 +111,7 @@ async def _local_job(job: Job, bot: Bot) -> None:
     if not await _telegram_upload(bot, job):
         raise RuntimeError("Telegram upload failed; verified output retained")
     job.progress, job.stage = 100.0, "published"
+    cleanup_workspace(output.parent, output, keep_output=True)
 
 
 async def _run_with_failover(job: Job, bot: Bot) -> None:
