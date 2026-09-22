@@ -40,6 +40,11 @@ class JobQueue:
                     return job
             return None
 
+    async def persist(self, job: Job) -> None:
+        async with self._lock:
+            if self.store:
+                self.store.save(job)
+
     async def requeue(self, job_id: str) -> None:
         async with self._lock:
             job = self._jobs.get(job_id)
