@@ -44,6 +44,7 @@ def apply_sync(video: Path, analysis: SyncAnalysis, output: Path) -> None:
     streams = _probe_audio_layout(video)
     if not streams:
         raise SyncVerificationError("No audio stream found")
+    source_layouts = [(s.get("channels"), s.get("channel_layout"), s.get("sample_rate")) for s in streams]
 
     if abs(offset) < 0.005:
         _run([
@@ -53,26 +54,32 @@ def apply_sync(video: Path, analysis: SyncAnalysis, output: Path) -> None:
         ])
         return
 
-    # Use per-stream filters. adelay is channel-preserving when all=1.
-    if offset > 0:
-        filter_expr = f"[0:a:0]asetpts=PTS-{offset}/TB[a0]"
-    else:
-        delay_ms = max(0, int(round(-offset * 1000)))
-        filter_expr = f"[0:a:0]adelay={delay_ms}:all=1[a0]"
+    # Correct every audio stream independently; never drop secondary/commentary tracks.
+    filters = []
+    maps = []
+    for i, _stream in enumerate(streams):
+        label = f"a{i}"
+        if offset > 0:
+            filters.append(f"[0:a:{i}]asetpts=PTS-{offset}/TB[{label}]")
+        else:
+            delay_ms = max(0, int(round(-offset * 1000)))
+            filters.append(f"[0:a:{i}]adelay={delay_ms}:all=1[{label}]")
+        maps.append(f"-map"); maps.append(f"[{label}]")
+    filter_expr = ";".join(filters)
 
     # PCM intermediate is lossless and keeps the original channel count/layout.
     # The final encode uses FLAC so sync correction does not introduce lossy audio.
     _run([
         "ffmpeg", "-v", "error", "-i", str(video),
         "-filter_complex", filter_expr,
-        "-map", "0:v?", "-map", "[a0]", "-map", "0:s?",
+        "-map", "0:v?", *maps, "-map", "0:s?",
         "-c:v", "copy", "-c:a", "flac", "-c:s", "copy",
         "-map_metadata", "0", "-y", str(output),
     ])
 
     after = _probe_audio_layout(output)
-    before_layout = [(s.get("channels"), s.get("channel_layout")) for s in streams]
-    after_layout = [(s.get("channels"), s.get("channel_layout")) for s in after]
+    before_layout = [(s.get("channels"), s.get("channel_layout"), s.get("sample_rate")) for s in streams]
+    after_layout = [(s.get("channels"), s.get("channel_layout"), s.get("sample_rate")) for s in after]
     if before_layout != after_layout:
         raise SyncVerificationError(
             f"Audio layout changed during sync: before={before_layout}, after={after_layout}"
