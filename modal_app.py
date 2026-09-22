@@ -541,7 +541,6 @@ def process_encode_task(
 
 @app.function(
     image=gpu_image,
-    gpu="T4",
     volumes={str(DATA_DIR): media_volume},
     secrets=[telegram_secret, remote_secret],
     cpu=8,
