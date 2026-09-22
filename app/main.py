@@ -1,9 +1,19 @@
 import asyncio
 import logging
+import re
+from pathlib import Path
+from urllib.parse import urlparse
+from uuid import uuid4
 
 from fastapi import FastAPI
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 from .backends import backend_selector
 from .config import settings
@@ -14,6 +24,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 log = logging.getLogger("vikky-bot")
 
 api = FastAPI(title="Vikky Movie AI Bot", version="0.1.0")
+MEDIA_RE = re.compile(r"\.(mkv|mp4|m4v|mov|webm|avi|ts|m2ts|zip|iso)$", re.I)
 
 
 @api.get("/health")
@@ -21,20 +32,83 @@ async def health() -> dict[str, str]:
     return {"status": "ok", "service": "vikky-movie-ai-bot"}
 
 
+def _workspace(user_id: int) -> Path:
+    path = settings.workspace_root / str(user_id) / uuid4().hex
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _job_type(context: ContextTypes.DEFAULT_TYPE) -> JobType | None:
+    value = context.user_data.get("pending_job_type")
+    return JobType(value) if value else None
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "🎬 Vikky Movie AI Bot\n\n"
-        "Foundation is online.\n"
-        "/status — system status\n"
+        "⚡ Fast intake + safe queue foundation online.\n"
+        "/sync — send media for synchronization\n"
+        "/upscale — send media for AI 4K\n"
+        "/encode — send media for encoding\n"
+        "/status — live job status\n"
         "/queue — queue snapshot\n"
+        "/cancel <job_id> — cancel a queued job\n"
         "/help — commands"
     )
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "/start\n/status\n/queue\n/cancel <job_id>\n\n"
-        "Processing commands will be enabled as each verified media module is added."
+        "/sync, /upscale, /encode → choose a job, then send MKV/MP4/ZIP/ISO\n"
+        "/status → current job\n/queue → queue\n/cancel <job_id> → cancel\n\n"
+        "Direct media URLs and accelerated aria2c intake are reserved for the next intake worker."
+    )
+
+
+async def choose_job(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    command = update.message.text.split()[0].lstrip("/").lower()
+    job_type = JobType(command)
+    context.user_data["pending_job_type"] = job_type.value
+    await update.message.reply_text(
+        f"✅ {job_type.value.upper()} selected.\n"
+        "Now send the MKV/MP4/ZIP/ISO file.\n"
+        "The bot will create a queued job and never overwrite the original."
+    )
+
+
+async def receive_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    job_type = _job_type(context)
+    if not job_type or not update.message:
+        return
+
+    document = update.message.document
+    video = update.message.video
+    media = document or video
+    if media is None:
+        return
+
+    name = Path(getattr(media, "file_name", None) or f"telegram_{uuid4().hex}.bin").name
+    if not MEDIA_RE.search(name):
+        await update.message.reply_text("❌ Unsupported media type. Use MKV/MP4/M4V/MOV/WEBM/AVI/TS/M2TS/ZIP/ISO.")
+        return
+
+    workspace = _workspace(update.effective_user.id)
+    destination = workspace / name
+    tg_file = await context.bot.get_file(media.file_id)
+    await tg_file.download_to_drive(custom_path=destination)
+
+    job = Job(type=job_type, source_name=name, source_path=destination)
+    await queue.add(job)
+    context.user_data.pop("pending_job_type", None)
+
+    snapshot = await queue.snapshot()
+    position = sum(1 for item in snapshot if item.status.value == "queued" and item.id != job.id)
+    await update.message.reply_text(
+        f"📥 Accepted: {name}\n"
+        f"🆔 Job: {job.id}\n"
+        f"📋 Queue position: {position + 1}\n"
+        f"⚡ Status: queued\n\n"
+        "Safe intake complete. Processing worker/backend selection is next."
     )
 
 
@@ -69,13 +143,20 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def run() -> None:
     if not settings.telegram_bot_token:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is not configured")
+    settings.workspace_root.mkdir(parents=True, exist_ok=True)
+
     application = Application.builder().token(settings.telegram_bot_token).build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("sync", choose_job))
+    application.add_handler(CommandHandler("upscale", choose_job))
+    application.add_handler(CommandHandler("encode", choose_job))
     application.add_handler(CommandHandler("status", status))
     application.add_handler(CommandHandler("queue", queue_command))
     application.add_handler(CommandHandler("cancel", cancel))
-    log.info("Vikky bot foundation starting")
+    application.add_handler(MessageHandler(filters.Document.ALL | filters.VIDEO, receive_media))
+
+    log.info("Vikky bot intake starting")
     await application.initialize()
     await application.start()
     await application.updater.start_polling(allowed_updates=Update.ALL_TYPES)
