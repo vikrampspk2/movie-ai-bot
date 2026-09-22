@@ -20,6 +20,10 @@ class SyncAnalysis:
     method: str
     reference_sample_rate: int
     candidate_sample_rate: int
+    reference_layout: str | None
+    candidate_layout: str | None
+    reference_sample_rate: int
+    candidate_sample_rate: int
     reference_channels: int
     candidate_channels: int
     reference_layout: str | None
@@ -59,7 +63,7 @@ def _audio_shape(path: Path) -> tuple[int, str | None, int]:
     channels = int(stream.get("channels") or 0)
     if channels < 1:
         raise ValueError(f"Invalid audio channel count: {path.name}")
-    return channels, stream.get("channel_layout"), int(stream.get("sample_rate") or 0)
+    return channels, stream.get("channel_layout"), int(stream.get("sample_rate") or 0), int(stream.get("sample_rate") or 0)
 
 
 def _pcm(path: Path, sample_rate: int, channels: int, seconds: float = 120.0) -> np.ndarray:
