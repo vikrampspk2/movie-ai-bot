@@ -12,11 +12,7 @@ DATA_PATH = "/data"
 
 remote_secret = modal.Secret.from_name(
     "vikky-remote",
-    required_keys=["VIKKY_REMOTE_TOKEN"],
-)
-telegram_secret = modal.Secret.from_name(
-    "vikky-telegram",
-    required_keys=["TELEGRAM_BOT_TOKEN"],
+    required_keys=["VIKKY_REMOTE_TOKEN", "TELEGRAM_BOT_TOKEN"],
 )
 volume = modal.Volume.from_name("vikky-media", create_if_missing=True)
 
@@ -49,7 +45,7 @@ async def _telegram_call(token: str, method: str, payload: dict) -> dict:
 
 @app.function(
     image=image,
-    secrets=[remote_secret, telegram_secret],
+    secrets=[remote_secret],
     volumes={DATA_PATH: volume},
     min_containers=1,
     max_containers=2,
