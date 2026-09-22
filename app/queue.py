@@ -5,19 +5,22 @@ from collections import deque
 from pathlib import Path
 
 from .models import Job, JobStatus
+from .persistence import JobStore
 
 
 class JobQueue:
-    """Async in-memory queue with bounded concurrency for the bot process."""
+    """Async queue backed by durable SQLite state."""
 
-    def __init__(self) -> None:
+    def __init__(self, store: JobStore | None = None) -> None:
         self._jobs: dict[str, Job] = {}
         self._pending: deque[str] = deque()
         self._lock = asyncio.Lock()
+        self.store = store
 
     async def add(self, job: Job) -> Job:
         async with self._lock:
             self._jobs[job.id] = job
+            if self.store: self.store.save(job)
             self._pending.append(job.id)
         return job
 
@@ -47,6 +50,7 @@ class JobQueue:
                 return False
             job.status = JobStatus.CANCELLED
             job.stage = "cancelled"
+            if self.store: self.store.save(job)
             return True
 
     async def snapshot(self) -> list[Job]:
