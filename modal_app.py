@@ -117,7 +117,7 @@ def tg_api(method: str, payload: dict[str, Any]) -> dict[str, Any]:
     return data
 
 def menu_markup() -> dict[str, Any]:
-    return {"keyboard":[["🔄 Audio Sync","📦 x265 Encode (3-5 GiB)"],["🎬 1080p Hybrid Remaster","👑 4K Theater Remaster"],["📊 Cluster Status","❌ Cancel / Reset"]],"resize_keyboard":True,"is_persistent":True}
+    return {"keyboard":[["📦 x265 Encode (3-5 GiB)","🎬 1080p Hybrid Remaster"],["👑 4K Theater Remaster","📊 Cluster Status"],["❌ Cancel / Reset"]],"resize_keyboard":True,"is_persistent":True}
 
 def cancel_markup(job_id: str) -> dict[str, Any]:
     return {"inline_keyboard":[[
@@ -474,72 +474,6 @@ def download_media(job_id:str,url:str,destination:Path,ui:LiveUI|None=None)->Pat
     p=aria2_download(job_id,resolve_platform_url(url),destination,ui)
     return safe_extract_zip(p,destination.parent/"unzipped",job_id) if p.suffix.lower()==".zip" else p
 
-def extract_reference_audio(job_id:str,reference_path:Path,scratch_dir:Path)->Path:
-    check_abort(job_id)
-    if reference_path.suffix.lower() in {".flac",".wav",".m4a",".aac",".mp3",".ogg",".opus"}:return reference_path
-    p=run_abortable(job_id,["ffprobe","-v","error","-select_streams","a","-show_entries","stream=index,codec_name,channels,channel_layout,bit_rate","-of","json",str(reference_path)],300)
-    streams=json.loads(p.stdout).get("streams",[])
-    if not streams:raise RuntimeError("Reference source contains no audio stream")
-    pref={"dts":100,"truehd":95,"flac":90,"eac3":85,"ac3":80}
-    best=max(streams,key=lambda s:(pref.get(str(s.get("codec_name") or "").lower(),10)+min(int(s.get("channels") or 0),8)*5,int(s.get("channels") or 0),int(s.get("bit_rate") or 0)))
-    out=scratch_dir/"reference_audio.flac"
-    run_abortable(job_id,["ffmpeg","-y","-v","error","-i",str(reference_path),"-map",f"0:{best['index']}","-vn","-c:a","flac",str(out)])
-    return out
-
-def studio_sync(job_id: str, reference_audio: Path, candidate_video: Path, output_path: Path) -> None:
-    """Lossless-layout audio replacement with mono acoustic alignment."""
-    check_abort(job_id)
-    analysis = DATA_DIR / "jobs" / job_id / "scratch"
-    candidate_mono = analysis / "candidate_mono.wav"
-    reference_mono = analysis / "reference_mono.wav"
-    run_abortable(job_id, ["ffmpeg","-y","-v","error","-i",str(candidate_video),"-vn","-ac","1","-ar","48000","-sample_fmt","s16","-af","highpass=f=300,lowpass=f=3400",str(candidate_mono)])
-    run_abortable(job_id, ["ffmpeg","-y","-v","error","-i",str(reference_audio),"-vn","-ac","1","-ar","48000","-sample_fmt","s16","-af","highpass=f=300,lowpass=f=3400",str(reference_mono)])
-    import numpy as np
-    from scipy import signal
-    import soundfile as sf
-    cand, _ = sf.read(candidate_mono, dtype="float32", always_2d=False)
-    ref, _ = sf.read(reference_mono, dtype="float32", always_2d=False)
-    if cand.ndim != 1: cand=cand.mean(axis=1)
-    if ref.ndim != 1: ref=ref.mean(axis=1)
-    rate=48000
-    stride=48
-    cand_ds=cand[::stride]
-    ref_ds=ref[::stride]
-    if len(cand_ds)<1000 or len(ref_ds)<1000:
-        raise RuntimeError("Insufficient audio for acoustic synchronization")
-    window=min(60*1000,len(cand_ds))
-    probe=cand_ds[:window]
-    probe=probe-np.mean(probe)
-    norm=np.linalg.norm(probe)+1e-9
-    corr=signal.correlate(ref_ds,probe,mode="valid",method="fft")
-    scale=np.convolve(ref_ds*ref_ds,np.ones(window,dtype=np.float32),mode="valid")
-    scores=corr/(np.sqrt(np.maximum(scale,1e-9))*norm)
-    best=int(np.argmax(scores))
-    offset=best*stride/rate
-    confidence=float(scores[best])
-    if confidence < 0.08:
-        raise RuntimeError(f"Acoustic sync confidence too low ({confidence:.3f})")
-    corrected=analysis/"aligned_reference.flac"
-    probe_info=run_abortable(job_id,["ffprobe","-v","error","-show_entries","format=duration","-of","default=nw=1:nk=1",str(candidate_video)],120)
-    try: duration=float(probe_info.stdout.strip())
-    except Exception: duration=0.0
-    if offset > 0.01:
-        run_abortable(job_id,["ffmpeg","-y","-v","error","-ss",f"{offset:.6f}","-i",str(reference_audio),"-map","0:a:0","-c:a","flac",str(corrected)])
-        source_audio=corrected
-    elif offset < -0.01:
-        pad=-offset
-        run_abortable(job_id,["ffmpeg","-y","-v","error","-i",str(reference_audio),"-map","0:a:0","-af",f"adelay={pad*1000:.3f}:all=1","-c:a","flac",str(corrected)])
-        source_audio=corrected
-    else:
-        source_audio=reference_audio
-    check_abort(job_id)
-    mux=["ffmpeg","-y","-v","error","-i",str(candidate_video),"-i",str(source_audio),"-map","0:v:0","-map","1:a:0","-c:v","copy","-c:a","copy","-map_metadata","0","-avoid_negative_ts","make_zero"]
-    if duration>0: mux += ["-t",f"{duration:.6f}"]
-    mux += [str(output_path)]
-    run_abortable(job_id,mux,86400)
-    verify_output(output_path)
-
-
 def run_ffmpeg_remaster(job_id: str, source_path: Path, output_path: Path, four_k: bool = False) -> None:
     if four_k:
         vf = "scale=3840:2160:flags=lanczos+accurate_rnd,hqdn3d=1.2:1.2:2.5:2.5,deband=range=20:blur=true:coupling=true,unsharp=5:5:0.65:5:5:0.0,colorbalance=gs=-0.025:gm=-0.01:gb=0.015:ms=-0.015:mm=0.00:mb=0.025:hs=-0.01:hm=0.00:hb=0.01,eq=saturation=1.16:contrast=1.07:brightness=0.01,noise=c1s=4:c1f=t,format=yuv420p10le"
@@ -619,7 +553,6 @@ def dispatch_next()->None:
     if not job:return
     args=(job["job_id"],int(job["chat_id"]),*job["args"])
     try:
-        if job["kind"]=="sync": process_sync_task.spawn(*args)
         elif job["kind"]=="encode_x265": process_encode_task.spawn(*args)
         elif job["kind"]=="remaster_1080p": process_remaster_task.spawn(*args,False)
         elif job["kind"]=="remaster_4k": process_remaster_task.spawn(*args,True)
@@ -673,10 +606,6 @@ def execute_media_job(job_id:str,chat_id:int,name:str,sources:list[str],processo
         clear_abort(job_id)
         commit_volume(job_id)
         finish_job(job_id)
-
-@app.function(image=base_image,volumes={str(DATA_DIR):media_volume},secrets=[telegram_secret,remote_secret],cpu=8,memory=32768,timeout=86400,max_containers=1)
-def process_sync_task(job_id:str,chat_id:int,candidate_url:str,audio_url:str):
-    execute_media_job(job_id,chat_id,"Audio Sync",[candidate_url,audio_url],lambda ref,cand,out:studio_sync(job_id,ref,cand,out),"Sync by Vikky.mkv","🎛️ 60s Sliding Acoustic Correlation / Dynamic Timeline Alignment...")
 
 @app.function(image=base_image,volumes={str(DATA_DIR):media_volume},secrets=[telegram_secret,remote_secret],cpu=8,memory=32768,timeout=86400,max_containers=1)
 def process_encode_task(job_id:str,chat_id:int,source_url:str):
