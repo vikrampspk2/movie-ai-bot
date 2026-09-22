@@ -19,6 +19,7 @@ from .backends import backend_selector
 from .config import settings
 from .models import Job, JobType
 from .queue import queue
+from .worker import worker_loop
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("vikky-bot")
@@ -69,6 +70,7 @@ async def choose_job(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     command = update.message.text.split()[0].lstrip("/").lower()
     job_type = JobType(command)
     context.user_data["pending_job_type"] = job_type.value
+    context.user_data["sync_files"] = []
     await update.message.reply_text(
         f"✅ {job_type.value.upper()} selected.\n"
         "Now send the MKV/MP4/ZIP/ISO file.\n"
@@ -97,9 +99,19 @@ async def receive_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     tg_file = await context.bot.get_file(media.file_id)
     await tg_file.download_to_drive(custom_path=destination)
 
-    job = Job(type=job_type, source_name=name, source_path=destination)
+    if job_type == JobType.SYNC:
+        files = context.user_data.setdefault("sync_files", [])
+        files.append(destination)
+        if len(files) == 1:
+            await update.message.reply_text("📌 SYNC reference/candidate mode: send the second media file. I will not self-sync one file.")
+            return
+        job = Job(type=job_type, source_name=files[1].name, source_path=files[1], reference_path=files[0], owner_id=update.effective_user.id)
+        context.user_data.pop("pending_job_type", None)
+        context.user_data.pop("sync_files", None)
+    else:
+        job = Job(type=job_type, source_name=name, source_path=destination, owner_id=update.effective_user.id)
+        context.user_data.pop("pending_job_type", None)
     await queue.add(job)
-    context.user_data.pop("pending_job_type", None)
 
     snapshot = await queue.snapshot()
     position = sum(1 for item in snapshot if item.status.value == "queued" and item.id != job.id)
@@ -156,6 +168,7 @@ async def run() -> None:
     application.add_handler(CommandHandler("cancel", cancel))
     application.add_handler(MessageHandler(filters.Document.ALL | filters.VIDEO, receive_media))
 
+    asyncio.create_task(worker_loop())
     log.info("Vikky bot intake starting")
     await application.initialize()
     await application.start()
