@@ -13,6 +13,10 @@ class Settings(BaseSettings):
     lightning_enabled: bool = False
     modal_enabled: bool = False
     kaggle_enabled: bool = False
+    telegram_max_upload_retries: int = 3
+    external_upload_retries: int = 3
+    gpu_required_for_upscale: bool = True
+    ffmpeg_threads: int = 0
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
