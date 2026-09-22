@@ -5,9 +5,6 @@ on:
     branches: [main, master]
   workflow_dispatch:
 
-permissions:
-  contents: read
-
 jobs:
   deploy:
     runs-on: ubuntu-latest
@@ -38,7 +35,7 @@ jobs:
           test -n "$MODAL_TOKEN_ID" || { echo "Missing MODAL_TOKEN_ID"; exit 1; }
           test -n "$MODAL_TOKEN_SECRET" || { echo "Missing MODAL_TOKEN_SECRET"; exit 1; }
           test -n "$TELEGRAM_BOT_TOKEN" || { echo "Missing TELEGRAM_BOT_TOKEN"; exit 1; }
-          test -n "$VIKKY_REMOTE_TOKEN" || { echo "Missing VIKKY_REMOTE_TOKEN (or TELEGRAM_BOT_TOKEN fallback)"; exit 1; }
+          test -n "$VIKKY_REMOTE_TOKEN" || { echo "Missing VIKKY_REMOTE_TOKEN"; exit 1; }
 
       - name: Provision Modal secrets
         shell: bash
@@ -48,27 +45,30 @@ jobs:
           modal secret create --force vikky-remote "VIKKY_REMOTE_TOKEN=$VIKKY_REMOTE_TOKEN"
 
       - name: Deploy to Modal
-        run: modal deploy modal_app.py
+        run: |
+          modal deploy modal_app.py
 
       - name: Configure and verify Telegram webhook
         shell: bash
         run: |
           set -euo pipefail
           APP_URL="$(python - <<'PY'
-import modal
-fn = modal.Function.from_name("vikky-movie-ai-bot", "api")
-url = fn.get_web_url()
-if not url:
-    raise SystemExit("Modal API URL unavailable")
-print(url.rstrip("/"))
-PY
-)"
-          echo "Modal URL: $APP_URL"
+          import modal
+          fn = modal.Function.from_name("vikky-movie-ai-bot", "api")
+          url = fn.get_web_url()
+          if not url:
+              raise SystemExit("Modal API URL unavailable")
+          print(url.rstrip("/"))
+          PY
+          )"
 
+          echo "Modal URL: $APP_URL"
           HEALTH="$(curl -fsS "$APP_URL/health")"
           echo "Health: $HEALTH"
 
-          curl -fsS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook"             -H "Content-Type: application/json"             -d "{"url":"${APP_URL}/webhook","allowed_updates":["message"]}"
+          curl -fsS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook" \
+            -H "Content-Type: application/json" \
+            -d "{\"url\": \"$APP_URL/webhook\"}"
 
           INFO="$(curl -fsS "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getWebhookInfo")"
           echo "Webhook: $INFO"
