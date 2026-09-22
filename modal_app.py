@@ -36,7 +36,6 @@ app = modal.App(APP_NAME)
     scaledown_window=300,
     retries=modal.Retries(max_retries=3, initial_delay=2, max_delay=30),
     timeout=120,
-    secrets=[modal.Secret.from_name("vikky-remote", required_keys=["VIKKY_REMOTE_TOKEN"])],
 )
 @modal.asgi_app()
 def api():
