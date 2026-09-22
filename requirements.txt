@@ -9,3 +9,4 @@ numpy>=2.2,<3
 torch>=2.6,<3
 realesrgan>=0.3.0,<1
 opencv-python-headless>=4.11,<5
+modal>=1.5,<2
