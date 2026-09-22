@@ -441,38 +441,112 @@ def job_workspace(job_id: str) -> tuple[Path, Path]:
 
 
 @app.function(image=base_image,volumes={str(DATA_DIR):media_volume},secrets=[telegram_secret,remote_secret],cpu=8,memory=32768,timeout=7200)
+QUEUE_FILE = DATA_DIR / "queue.json"
+ACTIVE_FILE = DATA_DIR / "active_job.json"
+QUEUE_LOCK = DATA_DIR / ".queue.lock"
+QUEUE_LIMIT = 100
+
+def _queue_lock(fn):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    while True:
+        try:
+            QUEUE_LOCK.mkdir(); break
+        except FileExistsError: time.sleep(0.05)
+    try: return fn()
+    finally: shutil.rmtree(QUEUE_LOCK, ignore_errors=True)
+
+def load_queue() -> list[dict[str, Any]]:
+    try:
+        value=json.loads(QUEUE_FILE.read_text(encoding="utf-8")); return value if isinstance(value,list) else []
+    except Exception: return []
+
+def save_queue(items:list[dict[str,Any]])->None:
+    tmp=QUEUE_FILE.with_suffix(".tmp"); tmp.write_text(json.dumps(items,ensure_ascii=False),encoding="utf-8"); os.replace(tmp,QUEUE_FILE)
+
+def get_active_job()->dict[str,Any]|None:
+    try:
+        value=json.loads(ACTIVE_FILE.read_text(encoding="utf-8")); return value if isinstance(value,dict) else None
+    except Exception:return None
+
+def enqueue_job(job:dict[str,Any])->int:
+    def op():
+        items=load_queue()
+        if len(items)>=QUEUE_LIMIT: raise RuntimeError("FIFO queue is full")
+        items.append(job); save_queue(items); return len(items)
+    return _queue_lock(op)
+
+def claim_next_job()->dict[str,Any]|None:
+    def op():
+        if get_active_job() is not None:return None
+        items=load_queue()
+        if not items:return None
+        job=items.pop(0); ACTIVE_FILE.write_text(json.dumps(job),encoding="utf-8"); save_queue(items); return job
+    return _queue_lock(op)
+
+def release_active(job_id:str)->None:
+    def op():
+        active=get_active_job()
+        if active and active.get("job_id")==job_id: ACTIVE_FILE.unlink(missing_ok=True)
+    _queue_lock(op)
+
+def queue_position(job_id:str)->int:
+    for index,item in enumerate(load_queue(),1):
+        if item.get("job_id")==job_id:return index
+    return 0
+
+def dispatch_next()->None:
+    job=claim_next_job()
+    if not job:return
+    args=(job["job_id"],int(job["chat_id"]),*job["args"])
+    try:
+        if job["kind"]=="sync": process_sync_task.spawn(*args)
+        elif job["kind"]=="encode_x265": process_encode_task.spawn(*args)
+        elif job["kind"]=="remaster_1080p": process_remaster_task.spawn(*args,False)
+        elif job["kind"]=="remaster_4k": process_remaster_task.spawn(*args,True)
+        else: raise RuntimeError("Unknown queued job type")
+    except Exception:
+        release_active(job["job_id"]); enqueue_job(job); raise
+
+def finish_job(job_id:str)->None:
+    release_active(job_id)
+    try: dispatch_next()
+    except Exception as exc: print(f"Queue dispatch error: {exc}",file=sys.stderr)
+
+def execute_media_job(job_id:str,chat_id:int,name:str,sources:list[str],processor,filename:str,stage3:str)->None:
+    media_volume.reload(); job_dir,scratch=job_workspace(job_id); output=job_dir/filename; ui=LiveUI(chat_id,job_id,name); stop=start_abort_watch(job_id)
+    try:
+        ui.start()
+        if len(sources)==2:
+            candidate=download_media(job_id,sources[0],scratch/"candidate",ui); ui.update(2,"🔍 Inspecting media & extracting reference audio...",25,force=True)
+            reference=download_media(job_id,sources[1],scratch/"reference",ui); reference_audio=extract_reference_audio(job_id,reference,scratch); ui.update(3,"🎛️ Analyzing Waveforms & Drift...",50,force=True); processor(reference_audio,candidate,output)
+        else:
+            source=download_media(job_id,sources[0],scratch/"source",ui); ui.update(2,"🔍 Inspecting media...",25,force=True); ui.update(3,stage3,50,force=True); processor(source,output)
+        check_abort(job_id); verify_output(output); ui.update(4,"☁️ Uploading output to cloud hosts...",88,force=True); links=upload_output(output)
+        ui.final("✅ Process Completed!\n\n"+f"📄 File: {output.name}\n📦 Verification: PASS\n🔗 Download Links:\n"+format_links(links)); output.unlink(missing_ok=True)
+    except JobCancelled: cleanup_scratch(scratch); ui.final("🛑 Process Cancelled by User. Scratch disk scrubbed.")
+    except Exception as exc: ui.final(f"❌ {name} failed.\n\nJob: {job_id}\nError: {exc}")
+    finally: stop.set(); cleanup_scratch(scratch); clear_abort(job_id); commit_volume(job_id); finish_job(job_id)
+
+@app.function(image=base_image,volumes={str(DATA_DIR):media_volume},secrets=[telegram_secret,remote_secret],cpu=8,memory=32768,timeout=7200,max_containers=1)
 def process_sync_task(job_id:str,chat_id:int,candidate_url:str,audio_url:str):
-    media_volume.reload();job_dir,scratch=job_workspace(job_id);output=job_dir/"Sync by Vikky.mkv";ui=LiveUI(chat_id,job_id,"Audio Sync");stop=start_abort_watch(job_id)
-    try:
-        from app.media.probe import probe
-        from app.sync.engine import sync_and_verify
-        ui.start();candidate=download_media(job_id,candidate_url,scratch/"candidate",ui);ui.update(2,"🔍 Inspecting media & extracting reference audio...",22,force=True)
-        reference=download_media(job_id,audio_url,scratch/"reference",ui);reference_audio=extract_reference_audio(job_id,reference,scratch);ui.update(3,"🎛️ Analyzing Waveforms & Drift...",50,force=True)
-        result=sync_and_verify(reference_audio,candidate,output);check_abort(job_id);verify_output(output);ui.update(4,"☁️ Uploading output to cloud hosts...",85,force=True)
-        links=upload_output(output);info=probe(output);ui.final("✅ Process Completed!\n\n"+f"📄 File: {output.name}\n"+f"🔊 Audio: {audio_summary(info)}\n📦 Verification: PASS\n🔗 Download Links:\n{format_links(links)}");output.unlink(missing_ok=True)
-    except JobCancelled:cleanup_scratch(job_dir);ui.final("🛑 Process Cancelled by User. System scratch cleaned.")
-    except Exception as exc:ui.final(f"❌ Audio Sync failed.\n\nJob: {job_id}\nError: {exc}")
-    finally:stop.set();cleanup_scratch(scratch);finish_job_dir(job_dir,output);clear_abort(job_id);commit_volume(job_id)
+    from app.sync.engine import sync_and_verify
+    execute_media_job(job_id,chat_id,"Audio Sync",[candidate_url,audio_url],lambda ref,cand,out:sync_and_verify(ref,cand,out),"Sync by Vikky.mkv","🎛️ Waveform Sync / Dynamic Drift Correction...")
 
-@app.function(image=base_image,volumes={str(DATA_DIR):media_volume},secrets=[telegram_secret,remote_secret],cpu=8,memory=32768,timeout=7200)
+@app.function(image=base_image,volumes={str(DATA_DIR):media_volume},secrets=[telegram_secret,remote_secret],cpu=8,memory=32768,timeout=7200,max_containers=1)
 def process_encode_task(job_id:str,chat_id:int,source_url:str):
-    media_volume.reload();job_dir,scratch=job_workspace(job_id);output=job_dir/"Vikky encoding.mkv";ui=LiveUI(chat_id,job_id,"Hybrid Remaster (1080p)");stop=start_abort_watch(job_id)
-    try:
-        ui.start();source=download_media(job_id,source_url,scratch/"source",ui);ui.update(2,"🔍 Inspecting media...",22,force=True);ui.update(3,"⚙️ Processing Hybrid Remaster...",50,force=True);run_ffmpeg_remaster(job_id,source,output);verify_output(output);ui.update(4,"☁️ Uploading output to cloud hosts...",88,force=True);links=upload_output(output);ui.final("✅ Process Completed!\n\n"+f"📄 File: {output.name}\n🎬 Profile: Hybrid Remaster 1080p / HEVC 10-bit\n🔊 Audio: Original layout preserved\n📦 Verification: PASS\n🔗 Download Links:\n{format_links(links)}");output.unlink(missing_ok=True)
-    except JobCancelled:cleanup_scratch(job_dir);ui.final("🛑 Process Cancelled by User. System scratch cleaned.")
-    except Exception as exc:ui.final(f"❌ Hybrid Remaster failed.\n\nJob: {job_id}\nError: {exc}")
-    finally:stop.set();cleanup_scratch(scratch);finish_job_dir(job_dir,output);clear_abort(job_id);commit_volume(job_id)
+    from app.encode import encode_to_mkv
+    execute_media_job(job_id,chat_id,"x265 Encode (3-5 GiB)",[source_url],lambda source,out:encode_to_mkv(source,out,target_min_gb=3.0,target_max_gb=5.0,max_attempts=3),"Vikky x265 Encode.mkv","⚙️ Original x265 Target-Size Encoding...")
 
-@app.function(image=base_image,volumes={str(DATA_DIR):media_volume},secrets=[telegram_secret,remote_secret],cpu=8,memory=32768,timeout=7200)
-def process_upscale_task(job_id:str,chat_id:int,source_url:str):
-    media_volume.reload();job_dir,scratch=job_workspace(job_id);workspace=job_dir/"upscale_workspace";workspace.mkdir(parents=True,exist_ok=True);output=job_dir/"Vikky AI Upscale 4K.mkv";ui=LiveUI(chat_id,job_id,"4K AI Upscale");stop=start_abort_watch(job_id)
-    try:
-        from app.media.probe import probe
-        from app.upscale import upscale_4k
-        ui.start();source=download_media(job_id,source_url,scratch/"source",ui);ui.update(2,"🔍 Inspecting media...",22,force=True);ui.update(3,"🧠 Running Real-ESRGAN 4K Upscale...",50,force=True);check_abort(job_id);upscale_4k(source,output,workspace);check_abort(job_id);verify_output(output);ui.update(4,"☁️ Uploading output to cloud hosts...",88,force=True);links=upload_output(output);info=probe(output);ui.final("✅ Process Completed!\n\n"+f"📄 File: {output.name}\n🖥 Resolution: {video_resolution(info)}\n🔊 Audio: {audio_summary(info)}\n📦 Verification: PASS\n🔗 Download Links:\n{format_links(links)}");output.unlink(missing_ok=True)
-    except JobCancelled:cleanup_scratch(job_dir);ui.final("🛑 Process Cancelled by User. System scratch cleaned.")
-    except Exception as exc:ui.final(f"❌ 4K AI Upscale failed.\n\nJob: {job_id}\nError: {exc}")
-    finally:stop.set();cleanup_scratch(scratch,workspace);finish_job_dir(job_dir,output);clear_abort(job_id);commit_volume(job_id)
+@app.function(image=base_image,volumes={str(DATA_DIR):media_volume},secrets=[telegram_secret,remote_secret],cpu=8,memory=32768,timeout=7200,max_containers=1)
+def process_remaster_task(job_id:str,chat_id:int,source_url:str,four_k:bool=False):
+    name="4K Theater Remaster" if four_k else "1080p Hybrid Remaster"; filename="Vikky 4K Theater Remaster.mkv" if four_k else "Vikky Hybrid Remaster 1080p.mkv"
+    execute_media_job(job_id,chat_id,name,[source_url],lambda source,out:run_ffmpeg_remaster(job_id,source,out,four_k),filename,"🎬 4K Theater Master / 30+ Filter Equivalent..." if four_k else "🎬 15+ Filter Hybrid Remaster...")
+
+def submit_job(chat_id:int,kind:str,args:list[str])->tuple[str,int]:
+    job_id=os.urandom(4).hex(); enqueue_job({"job_id":job_id,"chat_id":chat_id,"kind":kind,"args":args,"created_at":time.time()})
+    try: dispatch_next()
+    except Exception as exc: print(f"Initial queue dispatch error: {exc}",file=sys.stderr)
+    active=get_active_job(); return job_id,(0 if active and active.get("job_id")==job_id else queue_position(job_id))
 
 
 web_app = FastAPI(title="Vikky Movie AI Bot Control Plane")
@@ -487,48 +561,49 @@ async def health_check() -> dict[str, str]:
 
 
 @web_app.post("/webhook")
-async def telegram_webhook(request:Request)->JSONResponse:
-    try:data=await request.json()
-    except Exception:return JSONResponse(status_code=200,content={"status":"ignored"})
-    cb=data.get("callback_query")
-    if cb:
-        cid=str(cb.get("id") or "");d=str(cb.get("data") or "");m=cb.get("message") or {};chat_id=int((m.get("chat") or {}).get("id") or 0)
-        if d.startswith("abort_"):
-            job_id=d[6:];request_abort(job_id);clear_user_state(chat_id);answer_callback(cid,"Cancellation requested");edit_tg_message(chat_id,m.get("message_id"),f"🛑 Cancellation requested for Job {job_id}... stopping active processes.",{"inline_keyboard":[]})
-        else:answer_callback(cid)
+async def telegram_webhook(request: Request) -> JSONResponse:
+    try: data=await request.json()
+    except Exception: return JSONResponse(status_code=200,content={"status":"ignored"})
+    callback=data.get("callback_query")
+    if callback:
+        cid=str(callback.get("id") or ""); payload=str(callback.get("data") or ""); msg=callback.get("message") or {}; chat_id=int((msg.get("chat") or {}).get("id") or 0)
+        if payload.startswith("abort_"):
+            job_id=payload[6:]; active=get_active_job()
+            if active and active.get("job_id")==job_id:
+                request_abort(job_id); cleanup_scratch(JOBS_DIR/job_id/"scratch"); answer_callback(cid,"Cancellation requested"); edit_tg_message(chat_id,msg.get("message_id"),"🛑 Process Cancelled by User. Scratch disk scrubbed.",{"inline_keyboard":[]})
+            else: answer_callback(cid,"Job is not active")
+        else: answer_callback(cid)
         return JSONResponse(status_code=200,content={"status":"ok"})
     msg=data.get("message") or data.get("edited_message")
-    if not msg or "text" not in msg:return JSONResponse(status_code=200,content={"status":"no_text"})
-    chat_id=int((msg.get("chat") or {}).get("id") or 0);text=str(msg.get("text") or "").strip()
+    if not msg or "text" not in msg:return JSONResponse(status_code=200,content={"status":"ignored"})
+    chat_id=int((msg.get("chat") or {}).get("id") or 0); text=str(msg.get("text") or "").strip()
     if text in {"/start","/help"}:
-        clear_user_state(chat_id);send_tg_message(chat_id,"🤖 Vikky Movie AI Bot\n\nChoose an operation below. Jobs can be cancelled from the live status message.",menu=True);return JSONResponse(status_code=200,content={"status":"ok"})
+        clear_user_state(chat_id); send_tg_message(chat_id,"🤖 Vikky Movie AI Bot\n\nSelect a media operation:",menu=True); return JSONResponse(status_code=200,content={"status":"ok"})
     if text in {"❌ Cancel / Reset","/cancel"}:
-        st=get_user_state(chat_id)
-        if st and st.get("job_id"):request_abort(str(st["job_id"]))
-        clear_user_state(chat_id);send_tg_message(chat_id,"🛑 Process cancellation/reset requested. Choose a new operation.",menu=True);return JSONResponse(status_code=200,content={"status":"ok"})
-    if text in {"📊 Cluster Status","/status"}:
-        send_tg_message(chat_id,"🟢 Cluster Status: Online\n\n• Modal Serverless\n• /data persistent volume\n• Workers: 8 CPU / 32 GB RAM\n• GPU scheduling: disabled\n• Timeout: 7200s",menu=True);return JSONResponse(status_code=200,content={"status":"ok"})
-    if text=="🔄 Audio Sync":
-        set_user_state(chat_id,{"action":"sync","step":"awaiting_video"});send_tg_message(chat_id,"📥 Step 1/2: Please send the Main Video Source (Candidate Video) link:",menu=True);return JSONResponse(status_code=200,content={"status":"awaiting_video"})
-    if text=="🎬 Hybrid Remaster (1080p)":
-        set_user_state(chat_id,{"action":"remaster","step":"awaiting_video"});send_tg_message(chat_id,"📥 Please send the Video link to Remaster & Encode (1080p x265):",menu=True);return JSONResponse(status_code=200,content={"status":"awaiting_video"})
-    if text=="🧠 4K AI Upscale":
-        set_user_state(chat_id,{"action":"upscale","step":"awaiting_video"});send_tg_message(chat_id,"📥 Please send the Video link for CPU-based 4K AI Upscale:",menu=True);return JSONResponse(status_code=200,content={"status":"awaiting_video"})
-    st=get_user_state(chat_id)
-    if st:
-        if not is_valid_url(text):
-            send_tg_message(chat_id,"❌ Please send a valid HTTP/HTTPS direct or stream link.",menu=True);return JSONResponse(status_code=200,content={"status":"invalid_url"})
-        action,step=st.get("action"),st.get("step")
+        state=get_user_state(chat_id); active=get_active_job()
+        if state and state.get("job_id"):request_abort(str(state["job_id"]))
+        if active and int(active.get("chat_id",-1))==chat_id:request_abort(str(active["job_id"]))
+        clear_user_state(chat_id); send_tg_message(chat_id,"🛑 Cancel / Reset requested. Conversation state cleared.",menu=True); return JSONResponse(status_code=200,content={"status":"ok"})
+    if text=="📊 Cluster Status":
+        active=get_active_job(); pending=len(load_queue()); send_tg_message(chat_id,"🟢 Cluster Status: Online\n\nActive: "+str(active.get("job_id") if active else "None")+"\nPending FIFO: "+str(pending)+"\nWorkers: 8 CPU / 32 GB RAM / 7200s\nGPU: disabled\nStorage: /data\nConcurrency: 1",menu=True); return JSONResponse(status_code=200,content={"status":"ok"})
+    prompts={"🔄 Audio Sync":("sync","📥 Step 1/2: Please send the Main Video Source (Candidate Video) direct link:"),"📦 x265 Encode (3-5 GiB)":("encode_x265","📥 Please send the Video direct link for High-Efficiency x265 Encoding (Target: 3-5 GiB):"),"🎬 1080p Hybrid Remaster":("remaster_1080p","📥 Please send the Video direct link to Remaster & Encode (1080p x265 15+ Filters):"),"👑 4K Theater Remaster":("remaster_4k","📥 Please send the Video direct link for 4K Theater Remastering (3840x2160 30+ Filters):")}
+    if text in prompts:
+        action,prompt=prompts[text]; set_user_state(chat_id,{"action":action,"step":"awaiting_video"}); send_tg_message(chat_id,prompt,menu=True); return JSONResponse(status_code=200,content={"status":"awaiting_video"})
+    state=get_user_state(chat_id)
+    if state:
+        if not is_valid_url(text): send_tg_message(chat_id,"❌ Please provide a valid HTTP/HTTPS direct media link.",menu=True); return JSONResponse(status_code=200,content={"status":"invalid_url"})
+        action,step=state.get("action"),state.get("step")
         if action=="sync" and step=="awaiting_video":
-            set_user_state(chat_id,{"action":"sync","step":"awaiting_audio","candidate_url":text});send_tg_message(chat_id,"🎵 Step 2/2: Now send the Audio Source link (or a Reference Video containing the audio):",menu=True);return JSONResponse(status_code=200,content={"status":"awaiting_audio"})
-        job_id=os.urandom(4).hex()
-        if action=="sync" and step=="awaiting_audio":
-            set_user_state(chat_id,{"action":"sync","step":"running","job_id":job_id});process_sync_task.spawn(job_id,chat_id,str(st["candidate_url"]),text);return JSONResponse(status_code=200,content={"status":"queued","job_id":job_id})
-        if action=="remaster" and step=="awaiting_video":
-            set_user_state(chat_id,{"action":"remaster","step":"running","job_id":job_id});process_encode_task.spawn(job_id,chat_id,text);return JSONResponse(status_code=200,content={"status":"queued","job_id":job_id})
-        if action=="upscale" and step=="awaiting_video":
-            set_user_state(chat_id,{"action":"upscale","step":"running","job_id":job_id});process_upscale_task.spawn(job_id,chat_id,text);return JSONResponse(status_code=200,content={"status":"queued","job_id":job_id})
-    send_tg_message(chat_id,"Choose an operation from the menu above.",menu=True);return JSONResponse(status_code=200,content={"status":"ignored"})
+            set_user_state(chat_id,{"action":"sync","step":"awaiting_audio","candidate_url":text}); send_tg_message(chat_id,"🎵 Step 2/2: Now send the Audio Source direct link (or a Reference Video containing the audio):",menu=True); return JSONResponse(status_code=200,content={"status":"awaiting_audio"})
+        clear_user_state(chat_id)
+        if action=="sync" and step=="awaiting_audio": job_id,pos=submit_job(chat_id,"sync",[str(state["candidate_url"]),text])
+        elif action=="encode_x265" and step=="awaiting_video": job_id,pos=submit_job(chat_id,"encode_x265",[text])
+        elif action=="remaster_1080p" and step=="awaiting_video": job_id,pos=submit_job(chat_id,"remaster_1080p",[text])
+        elif action=="remaster_4k" and step=="awaiting_video": job_id,pos=submit_job(chat_id,"remaster_4k",[text])
+        else: send_tg_message(chat_id,"❌ Invalid conversation state. Please start again.",menu=True); return JSONResponse(status_code=200,content={"status":"invalid_state"})
+        if pos: send_tg_message(chat_id,"⏳ Task Added to Queue (Position: #"+str(pos)+")\nJob ID: "+job_id+"\nProcessing will automatically begin as soon as the active job completes.",menu=True)
+        return JSONResponse(status_code=200,content={"status":"queued","job_id":job_id})
+    send_tg_message(chat_id,"Please choose an operation from the menu below.",menu=True); return JSONResponse(status_code=200,content={"status":"ignored"})
 
 
 @web_app.get("/jobs")
