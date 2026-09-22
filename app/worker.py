@@ -7,6 +7,7 @@ from .models import Job, JobStatus, JobType
 from .queue import queue
 from .sync.engine import sync_and_verify
 from .encode import encode_to_mkv
+from .upscale import upscale_4k
 from .uploaders import upload_to_all
 log = logging.getLogger("vikky-worker")
 
@@ -49,6 +50,20 @@ async def process_job(job: Job, bot: Bot) -> None:
     try:
         if job.type == JobType.SYNC:
             await _sync_job(job, bot)
+        elif job.type == JobType.UPSCALE:
+            if job.source_path is None: raise ValueError("UPSCALE requires source media")
+            output = job.source_path.parent / "Vikky AI Upscale 4K.mkv"
+            job.stage, job.progress, job.backend = "ai_upscaling", 10.0, "gpu"
+            result = await asyncio.to_thread(upscale_4k, job.source_path, output, job.source_path.parent / "upscale-work")
+            job.output_path, job.checkpoint, job.progress = output, str(output), 80.0
+            job.audio_layout = "preserved"
+            job.media_info = result
+            job.verified = True
+            job.stage = "external_uploads"
+            job.upload_links = await upload_to_all(output)
+            job.stage = "telegram_upload"
+            if not await _telegram_upload(bot, job): raise RuntimeError("Telegram upload failed; verified output retained")
+            job.progress, job.stage = 100.0, "published"
         elif job.type == JobType.ENCODE:
             if job.source_path is None: raise ValueError("ENCODE requires source media")
             output = job.source_path.parent / "Vikky encoding.mkv"
