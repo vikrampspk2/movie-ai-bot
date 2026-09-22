@@ -452,7 +452,6 @@ def job_workspace(job_id: str) -> tuple[Path, Path]:
     return job_dir, scratch
 
 
-@app.function(image=base_image,volumes={str(DATA_DIR):media_volume},secrets=[telegram_secret,remote_secret],cpu=8,memory=32768,timeout=86400)
 QUEUE_FILE = DATA_DIR / "queue.json"
 ACTIVE_FILE = DATA_DIR / "active_job.json"
 QUEUE_LOCK = DATA_DIR / ".queue.lock"
