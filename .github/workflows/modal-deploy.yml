@@ -11,6 +11,7 @@ jobs:
     env:
       MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
       MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -22,6 +23,26 @@ jobs:
 
       - name: Install Modal
         run: python -m pip install --upgrade pip modal httpx
+
+      - name: Provision Telegram secret
+        shell: bash
+        run: |
+          set +x
+          python - <<'PY'
+          import os
+          import subprocess
+
+          token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+          if not token:
+              raise SystemExit("GitHub secret TELEGRAM_BOT_TOKEN is missing")
+          subprocess.run(
+              ["modal", "secret", "create", "vikky-telegram", "TELEGRAM_BOT_TOKEN=" + token],
+              check=True,
+              stdout=subprocess.DEVNULL,
+              stderr=subprocess.STDOUT,
+          )
+          print("Modal Telegram secret provisioned.")
+          PY
 
       - name: Deploy
         run: modal deploy modal_app.py
