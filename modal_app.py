@@ -362,16 +362,28 @@ def safe_extract_zip(zip_path:Path,destination:Path,job_id:str)->Path:
     files=[p for p in destination.rglob("*") if is_media_file(p)]
     if not files:raise RuntimeError("ZIP contains no supported media")
     zip_path.unlink(missing_ok=True);return max(files,key=lambda p:p.stat().st_size)
-def resolve_gofile(url:str)->str:
-    m=re.search(r"/d/([A-Za-z0-9]+)",url)
-    if not m:return url
+def resolve_gofile(url: str) -> str:
+    match = re.search(r"/d/([A-Za-z0-9]+)", url)
+    if not match: return url
+    content_id = match.group(1)
     try:
-        with httpx.Client(timeout=30,follow_redirects=True) as client:data=client.get(f"https://api.gofile.io/contents/{m.group(1)}").json().get("data") or {}
-        if isinstance(data.get("link"),str):return data["link"]
-        ch=data.get("children") or {}
-        files=[v for v in ch.values() if isinstance(v,dict) and v.get("link")] if isinstance(ch,dict) else []
-        return str(max(files,key=lambda x:x.get("size",0))["link"]) if files else url
-    except Exception:return url
+        with httpx.Client(timeout=45, follow_redirects=True) as client:
+            account = client.post("https://api.gofile.io/accounts", json={})
+            account.raise_for_status()
+            token = (account.json().get("data") or {}).get("token")
+            headers = {"Authorization": "Bearer " + token} if token else {}
+            response = client.get("https://api.gofile.io/contents/" + content_id, headers=headers)
+            response.raise_for_status()
+            data = response.json().get("data") or {}
+        direct = data.get("link")
+        if isinstance(direct,str) and direct.startswith(("http://","https://")): return direct
+        children = data.get("children") or {}
+        files = [v for v in children.values() if isinstance(v,dict) and v.get("link")] if isinstance(children,dict) else []
+        if files: return str(max(files,key=lambda x:int(x.get("size") or 0))["link"])
+    except Exception as exc:
+        print("GoFile resolver fallback: " + str(exc),file=sys.stderr)
+    return url
+
 def resolve_platform_url(url:str)->str:
     host=urlparse(url).netloc.lower()
     if "gofile.io" in host:return resolve_gofile(url)
@@ -387,7 +399,7 @@ def assert_not_html(path:Path):
     if b"<!doctype" in head or b"<html" in head:raise RuntimeError("❌ Error: Link returned an HTML web page instead of media. Please provide a direct download or stream link.")
 def aria2_download(job_id:str,url:str,destination:Path,ui:LiveUI|None=None)->Path:
     check_abort(job_id);destination.parent.mkdir(parents=True,exist_ok=True)
-    cmd=["aria2c","--allow-overwrite=true","--auto-file-renaming=false","--continue=true","--max-connection-per-server=16","--split=16","--min-split-size=1M","--file-allocation=none","--summary-interval=3","--console-log-level=warn","--dir",str(destination.parent),"--out",destination.name,url]
+    cmd=["aria2c","--allow-overwrite=true","--auto-file-renaming=false","--continue=true","-x","16","-s","16","-k","1M","-j","16","--max-connection-per-server=16","--split=16","--min-split-size=1M","--file-allocation=none","--summary-interval=3","--console-log-level=warn","--dir",str(destination.parent),"--out",destination.name,url]
     p=subprocess.Popen(cmd,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,text=True);last=0;tick=time.monotonic()
     try:
         while p.poll() is None:
