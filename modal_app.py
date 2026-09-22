@@ -452,7 +452,7 @@ def job_workspace(job_id: str) -> tuple[Path, Path]:
     return job_dir, scratch
 
 
-@app.function(image=base_image,volumes={str(DATA_DIR):media_volume},secrets=[telegram_secret,remote_secret],cpu=8,memory=32768,timeout=7200)
+@app.function(image=base_image,volumes={str(DATA_DIR):media_volume},secrets=[telegram_secret,remote_secret],cpu=8,memory=32768,timeout=86400)
 QUEUE_FILE = DATA_DIR / "queue.json"
 ACTIVE_FILE = DATA_DIR / "active_job.json"
 QUEUE_LOCK = DATA_DIR / ".queue.lock"
@@ -539,17 +539,17 @@ def execute_media_job(job_id:str,chat_id:int,name:str,sources:list[str],processo
     except Exception as exc: ui.final(f"❌ {name} failed.\n\nJob: {job_id}\nError: {exc}")
     finally: stop.set(); cleanup_scratch(scratch); clear_abort(job_id); commit_volume(job_id); finish_job(job_id)
 
-@app.function(image=base_image,volumes={str(DATA_DIR):media_volume},secrets=[telegram_secret,remote_secret],cpu=8,memory=32768,timeout=7200,max_containers=1)
+@app.function(image=base_image,volumes={str(DATA_DIR):media_volume},secrets=[telegram_secret,remote_secret],cpu=8,memory=32768,timeout=86400,max_containers=1)
 def process_sync_task(job_id:str,chat_id:int,candidate_url:str,audio_url:str):
     from app.sync.engine import sync_and_verify
     execute_media_job(job_id,chat_id,"Audio Sync",[candidate_url,audio_url],lambda ref,cand,out:sync_and_verify(ref,cand,out),"Sync by Vikky.mkv","🎛️ Waveform Sync / Dynamic Drift Correction...")
 
-@app.function(image=base_image,volumes={str(DATA_DIR):media_volume},secrets=[telegram_secret,remote_secret],cpu=8,memory=32768,timeout=7200,max_containers=1)
+@app.function(image=base_image,volumes={str(DATA_DIR):media_volume},secrets=[telegram_secret,remote_secret],cpu=8,memory=32768,timeout=86400,max_containers=1)
 def process_encode_task(job_id:str,chat_id:int,source_url:str):
     from app.encode import encode_to_mkv
     execute_media_job(job_id,chat_id,"x265 Encode (3-5 GiB)",[source_url],lambda source,out:encode_to_mkv(source,out,target_min_gb=3.0,target_max_gb=5.0,max_attempts=3),"Vikky x265 Encode.mkv","⚙️ Original x265 Target-Size Encoding...")
 
-@app.function(image=base_image,volumes={str(DATA_DIR):media_volume},secrets=[telegram_secret,remote_secret],cpu=8,memory=32768,timeout=7200,max_containers=1)
+@app.function(image=base_image,volumes={str(DATA_DIR):media_volume},secrets=[telegram_secret,remote_secret],cpu=8,memory=32768,timeout=86400,max_containers=1)
 def process_remaster_task(job_id:str,chat_id:int,source_url:str,four_k:bool=False):
     name="4K Theater Remaster" if four_k else "1080p Hybrid Remaster"; filename="Vikky 4K Theater Remaster.mkv" if four_k else "Vikky Hybrid Remaster 1080p.mkv"
     execute_media_job(job_id,chat_id,name,[source_url],lambda source,out:run_ffmpeg_remaster(job_id,source,out,four_k),filename,"🎬 4K Theater Master / 30+ Filter Equivalent..." if four_k else "🎬 15+ Filter Hybrid Remaster...")
