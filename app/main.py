@@ -44,9 +44,20 @@ async def receive_media(update,context):
     await queue.add(job); jobs=await queue.snapshot(); pos=sum(1 for x in jobs if x.status.value=="queued" and x.id!=job.id)+1
     await update.message.reply_text(f"📥 Accepted: {name}\n🆔 Job: {job.id}\n📋 Queue position: {pos}\n⚡ Status: queued")
 async def status(update,context):
-    jobs=await queue.snapshot(); running=next((j for j in jobs if j.status.value=="running"),None); selected=backend_selector.select(running) if running else None
-    text=f"🟢 Vikky status\nJobs: {len(jobs)}\nCurrent: {running.id if running else 'idle'}\nBackend: {selected.name if selected else 'not configured'}"
-    if running:text+=f"\nStage: {running.stage}\nProgress: {running.progress:.0f}%"
+    jobs=await queue.snapshot()
+    running=next((j for j in jobs if j.status.value=="running"),None)
+    selected=backend_selector.select(running) if running else None
+    queued=sum(1 for j in jobs if j.status.value=="queued")
+    text=(f"🟢 Vikky LIVE STATUS\nJobs: {len(jobs)} | Queue: {queued}\n"
+          f"Current: {running.id if running else 'idle'}\n"
+          f"Backend: {selected.name if selected else 'not configured'}")
+    if running:
+        text+=(f"\nType: {running.type.value.upper()}\nStage: {running.stage}"
+                f"\nProgress: {running.progress:.1f}%\nElapsed: {running.elapsed_seconds:.0f}s"
+                f"\nCheckpoint: {'yes' if running.checkpoint else 'no'}"
+                f"\nVerified: {'yes' if running.verified else 'pending'}")
+        if running.audio_layout:text+=f"\nAudio: {running.audio_layout} (preserved)"
+        if running.backend:text+=f"\nExecution: {running.backend}")
     await update.message.reply_text(text)
 async def queue_command(update,context):
     jobs=await queue.snapshot()
