@@ -120,7 +120,7 @@ async def receive_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"🆔 Job: {job.id}\n"
         f"📋 Queue position: {position + 1}\n"
         f"⚡ Status: queued\n\n"
-        "Safe intake complete. Processing worker/backend selection is next."
+        "Worker will process, verify, and publish the result."
     )
 
 
@@ -132,6 +132,8 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text += f"Jobs: {len(jobs)}\n"
     text += f"Current: {running.id if running else 'idle'}\n"
     text += f"Backend: {selected.name if selected else 'not configured'}"
+    if running:
+        text += f"\nStage: {running.stage}\nProgress: {running.progress:.0f}%"
     await update.message.reply_text(text)
 
 
