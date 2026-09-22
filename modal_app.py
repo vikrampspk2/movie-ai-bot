@@ -553,7 +553,7 @@ def dispatch_next()->None:
     if not job:return
     args=(job["job_id"],int(job["chat_id"]),*job["args"])
     try:
-        elif job["kind"]=="encode_x265": process_encode_task.spawn(*args)
+        if job["kind"]=="encode_x265": process_encode_task.spawn(*args)
         elif job["kind"]=="remaster_1080p": process_remaster_task.spawn(*args,False)
         elif job["kind"]=="remaster_4k": process_remaster_task.spawn(*args,True)
         else: raise RuntimeError("Unknown queued job type")
