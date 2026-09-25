@@ -12,39 +12,29 @@ jobs:
       MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
       MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
-      - name: Install Modal and Runner Dependencies
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           python -m pip install "modal>=1.5,<2" httpx fastapi
-
-      - name: Validate required GitHub secrets
+      - name: Validate secrets
         shell: bash
         run: |
           set -euo pipefail
           test -n "$MODAL_TOKEN_ID" || { echo "Missing MODAL_TOKEN_ID"; exit 1; }
           test -n "$MODAL_TOKEN_SECRET" || { echo "Missing MODAL_TOKEN_SECRET"; exit 1; }
           test -n "$TELEGRAM_BOT_TOKEN" || { echo "Missing TELEGRAM_BOT_TOKEN"; exit 1; }
-
       - name: Provision Modal Telegram secret
-        shell: bash
-        run: |
-          set -euo pipefail
-          modal secret create --force vikky-telegram "TELEGRAM_BOT_TOKEN=$TELEGRAM_BOT_TOKEN"
-
+        run: modal secret create --force vikky-telegram "TELEGRAM_BOT_TOKEN=$TELEGRAM_BOT_TOKEN"
       - name: Deploy to Modal
         run: modal deploy modal_app.py
-
-      - name: Configure and verify Telegram webhook
+      - name: Get Modal URL and verify health
         shell: bash
         run: |
           set -euo pipefail
@@ -57,14 +47,16 @@ jobs:
           print(url.rstrip("/"))
           PY
           )"
-
+          echo "APP_URL=$APP_URL" >> "$GITHUB_ENV"
           echo "Modal URL: $APP_URL"
-          HEALTH="$(curl -fsS "$APP_URL/health")"
-          echo "Health: $HEALTH"
-
-          curl -fsS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook" \
-            -H "Content-Type: application/json" \
-            -d "{\"url\": \"$APP_URL/webhook\"}"
-
-          INFO="$(curl -fsS "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getWebhookInfo")"
-          echo "Webhook: $INFO"
+          curl -fsS "$APP_URL/health"
+      - name: Configure Telegram webhook and commands
+        shell: bash
+        run: |
+          set -euo pipefail
+          WEBHOOK_URL="${APP_URL}/webhook"
+          curl -fsS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook"             -H "Content-Type: application/json"             -d "{\"url\": \"${WEBHOOK_URL}\", \"drop_pending_updates\": false}"
+          curl -fsS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setMyCommands"             -H "Content-Type: application/json"             -d '{"commands":[{"command":"help","description":"Bot ela vadalo Telugu/Tenglish help"}]}'
+          echo
+          echo "Webhook info:"
+          curl -fsS "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getWebhookInfo"
