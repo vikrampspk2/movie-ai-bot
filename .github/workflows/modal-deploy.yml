@@ -12,7 +12,6 @@ jobs:
       MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
       MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      VIKKY_REMOTE_TOKEN: ${{ secrets.VIKKY_REMOTE_TOKEN || secrets.TELEGRAM_BOT_TOKEN }}
 
     steps:
       - name: Checkout Code
@@ -35,18 +34,15 @@ jobs:
           test -n "$MODAL_TOKEN_ID" || { echo "Missing MODAL_TOKEN_ID"; exit 1; }
           test -n "$MODAL_TOKEN_SECRET" || { echo "Missing MODAL_TOKEN_SECRET"; exit 1; }
           test -n "$TELEGRAM_BOT_TOKEN" || { echo "Missing TELEGRAM_BOT_TOKEN"; exit 1; }
-          test -n "$VIKKY_REMOTE_TOKEN" || { echo "Missing VIKKY_REMOTE_TOKEN"; exit 1; }
 
-      - name: Provision Modal secrets
+      - name: Provision Modal Telegram secret
         shell: bash
         run: |
           set -euo pipefail
           modal secret create --force vikky-telegram "TELEGRAM_BOT_TOKEN=$TELEGRAM_BOT_TOKEN"
-          modal secret create --force vikky-remote "VIKKY_REMOTE_TOKEN=$VIKKY_REMOTE_TOKEN"
 
       - name: Deploy to Modal
-        run: |
-          modal deploy modal_app.py
+        run: modal deploy modal_app.py
 
       - name: Configure and verify Telegram webhook
         shell: bash
