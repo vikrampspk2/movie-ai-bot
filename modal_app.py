@@ -1,21 +1,9 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
-import json
 import os
-import re
-import shutil
-import subprocess
-import sys
-import tempfile
 import time
-import threading
-import traceback
-import zipfile
-from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, unquote, urljoin, urlparse
 
 import httpx
 import modal
@@ -23,708 +11,301 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 APP_NAME = "vikky-movie-ai-bot"
-DATA_DIR = Path("/data")
-JOBS_DIR = DATA_DIR / "jobs"
+OWNER_ID = 8742037337
+DELETE_AFTER = 24 * 60 * 60
 
 app = modal.App(APP_NAME)
+telegram_secret = modal.Secret.from_name("vikky-telegram", required_keys=["TELEGRAM_BOT_TOKEN"])
 
-media_volume = modal.Volume.from_name(
-    "vikky-media",
-    create_if_missing=True,
-)
-
-telegram_secret = modal.Secret.from_name(
-    "vikky-telegram",
-    required_keys=["TELEGRAM_BOT_TOKEN"],
-)
-
-remote_secret = modal.Secret.from_name(
-    "vikky-remote",
-    required_keys=["VIKKY_REMOTE_TOKEN"],
-)
-
-base_image = (
+image = (
     modal.Image.debian_slim(python_version="3.11")
-    .apt_install("ffmpeg", "aria2", "git")
-    .pip_install(
-        "fastapi[standard]>=0.115,<1",
-        "httpx>=0.28,<1",
-        "numpy>=1.24,<3",
-        "pydantic-settings>=2.7,<3",
-        "pycdlib>=1.14,<2",
-        "scipy>=1.11,<2",
-        "soundfile>=0.12,<1",
-        "requests>=2.31,<3",
-        "psutil>=5.9,<8",
-    )
-    .add_local_python_source("app")
+    .pip_install("fastapi[standard]>=0.115,<1", "httpx>=0.28,<1")
 )
 
-gpu_image = (
-    modal.Image.debian_slim(python_version="3.11")
-    .apt_install(
-        "ffmpeg",
-        "aria2",
-        "libgl1",
-        "libglib2.0-0",
-    )
-    .pip_install(
-        "torch==2.1.2",
-        "torchvision==0.16.2",
-        "torchaudio==2.1.2",
-    )
-    .pip_install(
-        "opencv-python-headless>=4.9,<5",
-        "numpy>=1.24,<3",
-        "fastapi[standard]>=0.115,<1",
-        "httpx>=0.28,<1",
-        "psutil>=5.9,<8",
-    )
-    .pip_install(
-        "basicsr>=1.4.2,<2",
-        "realesrgan>=0.3,<1",
-        extra_options="--no-build-isolation",
-    )
-    .add_local_python_source("app")
-)
+web_app = FastAPI()
+forward_enabled = False
+auto_delete_enabled = True
+
+# RAM only. No media/files/database are written by this relay.
+routes: dict[int, tuple[int, float]] = {}
+expiry: dict[tuple[int, int], float] = {}
 
 
-def run_async(awaitable: Any) -> Any:
-    if not inspect.isawaitable(awaitable):
-        return awaitable
-    return asyncio.run(awaitable)
-
-
-def call_flexible(func: Any, *args: Any, **kwargs: Any) -> Any:
-    return run_async(func(*args, **kwargs))
-
-
-def is_valid_url(url: str) -> bool:
-    try:
-        parsed = urlparse(url.strip())
-        return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
-    except Exception:
-        return False
-
-
-def tg_api(method: str, payload: dict[str, Any]) -> dict[str, Any]:
-    token=os.environ.get("TELEGRAM_BOT_TOKEN")
-    if not token: raise RuntimeError("TELEGRAM_BOT_TOKEN is not available")
-    with httpx.Client(timeout=30) as client:
-        response=client.post(f"https://api.telegram.org/bot{token}/{method}",json=payload)
-        response.raise_for_status(); data=response.json()
-    if not data.get("ok"): raise RuntimeError(data.get("description","Telegram API failed"))
-    return data
-
-def menu_markup() -> dict[str, Any]:
-    return {"keyboard":[["📦 x265 Encode (3-5 GiB)","🎬 1080p Hybrid Remaster"],["👑 4K Theater Remaster","📊 Cluster Status"],["❌ Cancel / Reset"]],"resize_keyboard":True,"is_persistent":True}
-
-def cancel_markup(job_id: str) -> dict[str, Any]:
-    return {"inline_keyboard":[[
-        {"text":"🔄 Refresh","callback_data":f"refresh_{job_id}"},
-        {"text":"❌ Cancel Process","callback_data":f"abort_{job_id}"}
-    ]]}
-
-def delete_tg_message(chat_id:int,message_id:int|None)->None:
-    if not message_id:
-        return
-    try:
-        tg_api("deleteMessage",{"chat_id":chat_id,"message_id":message_id})
-    except Exception:
-        pass
-
-def send_tg_message(chat_id:int,text:str,menu:bool=False,inline:dict[str,Any]|None=None)->int|None:
-    p={"chat_id":chat_id,"text":text}
-    if menu:p["reply_markup"]=menu_markup()
-    if inline is not None:p["reply_markup"]=inline
-    try:return int((tg_api("sendMessage",p).get("result") or {}).get("message_id"))
-    except Exception as exc: print(f"Telegram sendMessage failure: {exc}",file=sys.stderr); return None
-
-def edit_tg_message(chat_id:int,message_id:int|None,text:str,inline:dict[str,Any]|None=None)->None:
-    if not message_id:return
-    p={"chat_id":chat_id,"message_id":message_id,"text":text}
-    if inline is not None:p["reply_markup"]=inline
-    try:tg_api("editMessageText",p)
-    except Exception as exc:print(f"Telegram edit failure: {exc}",file=sys.stderr)
-
-def answer_callback(callback_id:str,text:str="")->None:
-    try:tg_api("answerCallbackQuery",{"callback_query_id":callback_id,"text":text})
-    except Exception:pass
-
-def progress_bar(percent:float)->str:
-    n=max(0,min(20,round(percent/5))); return "█"*n+"░"*(20-n)
-
-def fmt_time(seconds:float)->str:
-    s=max(0,int(seconds)); h,s=divmod(s,3600); m,s=divmod(s,60); return f"{h:02d}:{m:02d}:{s:02d}"
-
-def fmt_speed(bps:float)->str:
-    if bps<=0:return "—"
-    units=("B/s","KB/s","MB/s","GB/s"); i=0; v=float(bps)
-    while v>=1024 and i<3:v/=1024;i+=1
-    return f"{v:.1f} {units[i]}"
-
-class LiveUI:
-    def __init__(self, chat_id:int, job_id:str, task:str, message_id:int|None=None):
-        self.chat_id=chat_id; self.job_id=job_id; self.task=task; self.message_id=message_id
-        self.started=time.monotonic(); self.last_edit=0.0; self.last_bytes=0; self.last_sample=self.started
-
-    def render(self, stage:int, status:str, current_bytes:int=0, total_bytes:int|None=None,
-               speed:float=0.0, eta:str="—", percent:float|None=None) -> str:
-        elapsed=fmt_time(time.monotonic()-self.started)
-        mb=current_bytes/(1024**2)
-        if total_bytes and total_bytes>0 and percent is None:
-            percent=min(99.0,(current_bytes/total_bytes)*100.0)
-        if total_bytes and total_bytes>0 and percent is not None:
-            bar=progress_bar(percent)
-            return (f"🎬 Task: {self.task} (Job ID: {self.job_id})\n"
-                    f"Status: [{stage}/5] {status}\n"
-                    f"Progress: [{bar}] {percent:.0f}% ({mb:.1f} MB / {total_bytes/(1024**2):.1f} MB)\n"
-                    f"Speed: {fmt_speed(speed)} | Elapsed: {elapsed} | ETA: {eta}")
-        return (f"🎬 Task: {self.task} (Job ID: {self.job_id})\n"
-                f"Status: [{stage}/5] {status}\n"
-                f"Transferred: {mb:.2f} MB\n"
-                f"Speed: {fmt_speed(speed)} | Elapsed: {elapsed}")
-
-    def start(self, status:str="📥 Turbo Downloading Stream..."):
-        if self.message_id is None:
-            self.message_id=send_tg_message(self.chat_id,self.render(1,status),inline=cancel_markup(self.job_id))
-            self.last_edit=time.monotonic()
-
-    def update(self,stage:int,status:str,current_bytes:int=0,total_bytes:int|None=None,
-               force:bool=False,percent:float|None=None):
-        now=time.monotonic()
-        dt=now-self.last_sample
-        speed=(current_bytes-self.last_bytes)/dt if dt>0 and current_bytes>=self.last_bytes else 0.0
-        if current_bytes>=0:
-            self.last_bytes=current_bytes; self.last_sample=now
-        if not force and now-self.last_edit<3.5:
-            return
-        eta="—"
-        if speed>0 and total_bytes and total_bytes>current_bytes:
-            eta=fmt_time((total_bytes-current_bytes)/speed)
-        try:
-            if self.message_id is not None:
-                edit_tg_message(self.chat_id,self.message_id,
-                                self.render(stage,status,current_bytes,total_bytes,speed,eta,percent),
-                                cancel_markup(self.job_id))
-            self.last_edit=now
-        except Exception:
-            pass
-
-    def final(self,text:str):
-        try:
-            if self.message_id is not None:
-                edit_tg_message(self.chat_id,self.message_id,text,{"inline_keyboard":[]})
-        except Exception:
-            pass
-
-
-class JobCancelled(RuntimeError):pass
-def abort_path(job_id:str)->Path:return DATA_DIR/f"abort_{job_id}.flag"
-def request_abort(job_id:str):abort_path(job_id).write_text("abort",encoding="utf-8")
-def clear_abort(job_id:str):abort_path(job_id).unlink(missing_ok=True)
-def kill_children():
-    try:
-        import psutil
-        for p in reversed(psutil.Process(os.getpid()).children(recursive=True)):
-            try:p.kill()
-            except Exception:pass
-    except Exception:pass
-def check_abort(job_id:str):
-    if abort_path(job_id).exists():kill_children();raise JobCancelled("cancelled")
-def abort_watch(job_id:str,stop:threading.Event):
-    while not stop.wait(.5):
-        if abort_path(job_id).exists():kill_children();return
-def start_abort_watch(job_id:str):
-    stop=threading.Event();threading.Thread(target=abort_watch,args=(job_id,stop),daemon=True).start();return stop
-def run_abortable(job_id:str,command:list[str],timeout:int=86400):
-    check_abort(job_id);p=subprocess.Popen(command,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True);started=time.monotonic()
-    while p.poll() is None:
-        if abort_path(job_id).exists():p.kill();p.wait(timeout=5);raise JobCancelled("cancelled")
-        if time.monotonic()-started>timeout:p.kill();raise TimeoutError("process timeout")
-        time.sleep(.5)
-    out,err=p.communicate()
-    if p.returncode:raise subprocess.CalledProcessError(p.returncode,command,out,err)
-    return subprocess.CompletedProcess(command,0,out,err)
-
-
-USER_STATE_FILE = DATA_DIR / "user_state.json"
-
-
-def load_user_states() -> dict[str, dict[str, Any]]:
-    try:
-        if USER_STATE_FILE.exists():
-            raw = json.loads(USER_STATE_FILE.read_text(encoding="utf-8"))
-            return raw if isinstance(raw, dict) else {}
-    except Exception as exc:
-        print(f"State load error: {exc}", file=sys.stderr)
-    return {}
-
-
-def save_user_states(states: dict[str, dict[str, Any]]) -> None:
-    USER_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    tmp = USER_STATE_FILE.with_suffix(".tmp")
-    tmp.write_text(
-        json.dumps(states, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    os.replace(tmp, USER_STATE_FILE)
-
-
-def set_user_state(chat_id: int, state: dict[str, Any]) -> None:
-    states = load_user_states()
-    states[str(chat_id)] = state
-    save_user_states(states)
-
-
-def get_user_state(chat_id: int) -> dict[str, Any] | None:
-    return load_user_states().get(str(chat_id))
-
-
-def clear_user_state(chat_id: int) -> None:
-    states = load_user_states()
-    states.pop(str(chat_id), None)
-    save_user_states(states)
-
-
-def audio_summary(media_info: Any) -> str:
-    tracks = getattr(media_info, "tracks", None)
-    if tracks is not None:
-        values: list[str] = []
-        for track in tracks:
-            track_type = getattr(
-                track,
-                "codec_type",
-                getattr(track, "track_type", getattr(track, "type", getattr(track, "kind", None))),
-            )
-            if str(track_type).lower() != "audio":
-                continue
-            channels = getattr(track, "channels", None)
-            layout = getattr(track, "channel_layout", getattr(track, "layout", None))
-            sample_rate = getattr(track, "sample_rate", None)
-            codec = getattr(track, "codec_name", getattr(track, "codec", None))
-            if channels is not None or layout is not None:
-                values.append(
-                    f"{codec or '?'} {channels or '?'}ch {layout or 'layout-unknown'} "
-                    f"{sample_rate or '?'}Hz"
-                )
-        if values:
-            return ", ".join(values)
-    return "Preserved"
-
-
-def video_resolution(media_info: Any) -> str:
-    tracks = getattr(media_info, "tracks", None)
-    if tracks is None:
-        return "Unknown"
-    for track in tracks:
-        track_type = getattr(
-            track,
-            "codec_type",
-            getattr(track, "track_type", getattr(track, "type", getattr(track, "kind", None))),
+def tg(method: str, payload: dict[str, Any]) -> dict[str, Any]:
+    token = os.environ["TELEGRAM_BOT_TOKEN"]
+    with httpx.Client(timeout=35) as client:
+        response = client.post(
+            f"https://api.telegram.org/bot{token}/{method}",
+            json=payload,
         )
-        if str(track_type).lower() != "video":
-            continue
-        width = getattr(track, "width", None)
-        height = getattr(track, "height", None)
-        if width and height:
-            return f"{width}x{height}"
-    return "Unknown"
+        response.raise_for_status()
+        data = response.json()
+    if not data.get("ok"):
+        raise RuntimeError(data.get("description", "Telegram API error"))
+    return data["result"]
 
 
-def verify_output(path: Path) -> None:
-    if not path.exists() or path.stat().st_size < 1024 * 1024:
-        raise RuntimeError(f"Invalid output: {path}")
-    subprocess.run(
-        [
-            "ffprobe", "-v", "error",
-            "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1",
-            str(path),
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=120,
+def protect() -> bool:
+    return not forward_enabled
+
+
+def send_text(chat_id: int, text: str, *, protect_content: bool | None = None) -> dict:
+    payload: dict[str, Any] = {"chat_id": chat_id, "text": text}
+    if protect_content is not None:
+        payload["protect_content"] = protect_content
+    return tg("sendMessage", payload)
+
+
+def copy_message(to_chat: int, from_chat: int, message_id: int) -> dict:
+    return tg(
+        "copyMessage",
+        {
+            "chat_id": to_chat,
+            "from_chat_id": from_chat,
+            "message_id": message_id,
+            "protect_content": protect(),
+        },
     )
 
 
-def cleanup_scratch(*paths: Path) -> None:
-    for path in paths:
-        shutil.rmtree(path, ignore_errors=True)
-
-
-def upload_output(output_path: Path) -> dict[str, str]:
-    from app.uploaders import upload_to_all
-    result = call_flexible(upload_to_all, Path(output_path))
-    if not isinstance(result, dict):
-        raise RuntimeError("upload_to_all returned an invalid response")
-    successful = {
-        str(provider): value.strip()
-        for provider, value in result.items()
-        if isinstance(value, str) and value.strip() and not value.startswith("ERROR:")
-    }
-    if not successful:
-        raise RuntimeError(f"All upload providers failed: {result}")
-    return successful
-
-
-def format_links(links: dict[str, str]) -> str:
-    return "\n".join(f"• {name}: {url}" for name, url in links.items())
-
-
-def commit_volume(job_id: str) -> None:
+def delete_message(chat_id: int, message_id: int) -> None:
     try:
-        media_volume.commit()
-    except Exception as exc:
-        print(f"Volume commit error [{job_id}]: {exc}", file=sys.stderr)
-
-
-def finish_job_dir(job_dir: Path, output_path: Path) -> None:
-    if not output_path.exists() and job_dir.exists():
-        try:
-            job_dir.rmdir()
-        except OSError:
-            pass
-
-
-MEDIA_EXTENSIONS={".mkv",".mp4",".m4v",".mov",".avi",".webm",".ts",".m2ts",".mts",".mp3",".aac",".m4a",".flac",".wav",".ogg",".opus",".zip"}
-def is_media_file(p:Path)->bool:return p.is_file() and p.suffix.lower() in MEDIA_EXTENSIONS
-def safe_extract_zip(zip_path:Path,destination:Path,job_id:str)->Path:
-    check_abort(job_id);destination.mkdir(parents=True,exist_ok=True);root=destination.resolve()
-    with zipfile.ZipFile(zip_path) as z:
-        infos=z.infolist()
-        if len(infos)>10000 or sum(i.file_size for i in infos)>60*1024**3:raise RuntimeError("ZIP exceeds safe extraction limits")
-        for i in infos:
-            check_abort(job_id);t=(destination/i.filename).resolve()
-            if t!=root and root not in t.parents:raise RuntimeError("Unsafe ZIP path traversal detected")
-            if i.is_dir():continue
-            t.parent.mkdir(parents=True,exist_ok=True)
-            with z.open(i) as src,t.open("wb") as dst:
-                while True:
-                    check_abort(job_id);chunk=src.read(1024*1024)
-                    if not chunk:break
-                    dst.write(chunk)
-    files=[p for p in destination.rglob("*") if is_media_file(p)]
-    if not files:raise RuntimeError("ZIP contains no supported media")
-    zip_path.unlink(missing_ok=True);return max(files,key=lambda p:p.stat().st_size)
-def resolve_gofile(url: str) -> str:
-    match = re.search(r"/d/([A-Za-z0-9]+)", url)
-    if not match: return url
-    content_id = match.group(1)
-    try:
-        with httpx.Client(timeout=45, follow_redirects=True) as client:
-            account = client.post("https://api.gofile.io/accounts", json={})
-            account.raise_for_status()
-            token = (account.json().get("data") or {}).get("token")
-            headers = {"Authorization": "Bearer " + token} if token else {}
-            response = client.get("https://api.gofile.io/contents/" + content_id, headers=headers)
-            response.raise_for_status()
-            data = response.json().get("data") or {}
-        direct = data.get("link")
-        if isinstance(direct,str) and direct.startswith(("http://","https://")): return direct
-        children = data.get("children") or {}
-        files = [v for v in children.values() if isinstance(v,dict) and v.get("link")] if isinstance(children,dict) else []
-        if files: return str(max(files,key=lambda x:int(x.get("size") or 0))["link"])
-    except Exception as exc:
-        print("GoFile resolver fallback: " + str(exc),file=sys.stderr)
-    return url
-
-def resolve_platform_url(url:str)->str:
-    host=urlparse(url).netloc.lower()
-    if "gofile.io" in host:return resolve_gofile(url)
-    m=re.search(r"pixeldrain\.com/(?:u|l)/([A-Za-z0-9_-]+)",url)
-    if m:return f"https://pixeldrain.com/api/file/{m.group(1)}"
-    if "buzzheavier.com" in host or "gdflix" in host:
-        with httpx.Client(timeout=45,follow_redirects=True) as client:
-            r=client.get(url);r.raise_for_status();direct=_html_download_link(str(r.url),r.text)
-            if direct:return direct
-    return url
-def assert_not_html(path:Path):
-    with path.open("rb") as f:head=f.read(4096).lstrip().lower()
-    if b"<!doctype" in head or b"<html" in head:raise RuntimeError("❌ Error: Link returned an HTML web page instead of media. Please provide a direct download or stream link.")
-def aria2_download(job_id:str,url:str,destination:Path,ui:LiveUI|None=None)->Path:
-    check_abort(job_id);destination.parent.mkdir(parents=True,exist_ok=True)
-    total=None
-    try:
-        with httpx.Client(timeout=20,follow_redirects=True) as client:
-            h=client.head(url)
-            if h.status_code<400 and h.headers.get("content-length"):
-                total=int(h.headers["content-length"])
+        tg("deleteMessage", {"chat_id": chat_id, "message_id": message_id})
     except Exception:
         pass
-    cmd=["aria2c","--allow-overwrite=true","--auto-file-renaming=false","--continue=true","-x","16","-s","16","-k","1M","-j","16","--max-connection-per-server=16","--split=16","--min-split-size=1M","--file-allocation=none","--summary-interval=1","--console-log-level=warn","--dir",str(destination.parent),"--out",destination.name,url]
-    p=subprocess.Popen(cmd,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,text=True)
+
+
+def remember_message(chat_id: int, message_id: int) -> None:
+    if auto_delete_enabled:
+        expiry[(chat_id, message_id)] = time.time() + DELETE_AFTER
+
+
+def user_label(user: dict[str, Any]) -> str:
+    name = " ".join(
+        x for x in [user.get("first_name"), user.get("last_name")] if x
+    ).strip() or "Unknown"
+    username = f"@{user['username']}" if user.get("username") else "no username"
+    return f"👤 {name}\n🆔 {user.get('id')}\n🔗 {username}"
+
+
+def help_user() -> str:
+    return (
+        "🤖 Bot ni ela vadalo:\n\n"
+        "• Normal ga text/message pampandi.\n"
+        "• Photo, video, file, voice, audio, sticker, animation kuda pampochu.\n"
+        "• Mee message owner ki mee peru + User ID tho private ga relay avuthundi.\n"
+        "• Owner reply chesthe adi malli meeku direct ga vastundi.\n\n"
+        "🔐 Security:\n"
+        "• Bot local ga media/file save cheyyadu.\n"
+        "• Forward protection default ga ON.\n"
+        "• Auto delete default ga 24 hours.\n\n"
+        "Help kosam /help."
+    )
+
+
+def owner_help() -> str:
+    return (
+        "🔐 Owner controls:\n\n"
+        "/to USER_ID MESSAGE  → aa user ki text pampu\n"
+        "/forward on|off      → forward/save protection ON/OFF\n"
+        "/24h on|off           → relay messages 24h auto-delete ON/OFF\n"
+        "/help                 → ee help\n\n"
+        "User message meeda reply chesthe direct ga aa user ki velthundi.\n"
+        "Media caption lo /to USER_ID pedithe direct aa user ki media velthundi."
+    )
+
+
+def parse_to(text: str) -> tuple[int, str] | None:
+    parts = text.split(maxsplit=2)
+    if len(parts) < 2 or parts[0].lower() != "/to":
+        return None
     try:
-        while p.poll() is None:
-            check_abort(job_id)
-            size=destination.stat().st_size if destination.exists() else 0
-            if ui: ui.update(1,"📥 Turbo Downloading Stream...",size,total)
-            time.sleep(0.8)
-        err=p.stderr.read() if p.stderr else ""
-        if p.returncode: raise subprocess.CalledProcessError(p.returncode,cmd,stderr=err)
-    except JobCancelled:
-        p.kill();p.wait(timeout=5);raise
-    finally:
-        if p.poll() is None:p.kill();p.wait(timeout=5)
-    if not destination.exists() or destination.stat().st_size<=0:raise RuntimeError("aria2c produced no file")
-    assert_not_html(destination);return destination
-def download_media(job_id:str,url:str,destination:Path,ui:LiveUI|None=None)->Path:
-    if not is_valid_url(url):raise ValueError("Invalid HTTP/HTTPS media URL")
-    p=aria2_download(job_id,resolve_platform_url(url),destination,ui)
-    return safe_extract_zip(p,destination.parent/"unzipped",job_id) if p.suffix.lower()==".zip" else p
-
-def run_ffmpeg_remaster(job_id: str, source_path: Path, output_path: Path, four_k: bool = False) -> None:
-    if four_k:
-        vf = "scale=3840:2160:flags=lanczos+accurate_rnd,hqdn3d=1.2:1.2:2.5:2.5,deband=range=20:blur=true:coupling=true,unsharp=5:5:0.65:5:5:0.0,colorbalance=gs=-0.025:gm=-0.01:gb=0.015:ms=-0.015:mm=0.00:mb=0.025:hs=-0.01:hm=0.00:hb=0.01,eq=saturation=1.16:contrast=1.07:brightness=0.01,noise=c1s=4:c1f=t,format=yuv420p10le"
-        crf = "17"
-    else:
-        vf = "scale=1920:1080:flags=lanczos+accurate_rnd,hqdn3d=1.5:1.5:3:3,deband=range=16:blur=true:coupling=true,unsharp=5:5:0.7:5:5:0.0,colorbalance=gs=-0.02:gm=-0.01:gb=0.01:ms=-0.01:mm=0.00:mb=0.02,eq=saturation=1.14:contrast=1.06:brightness=0.01,noise=c1s=3:c1f=t,format=yuv420p10le"
-        crf = "18"
-    run_abortable(job_id, ["ffmpeg","-y","-v","error","-i",str(source_path),"-map","0:v:0","-map","0:a?","-map","0:s?","-vf",vf,"-c:v","libx265","-crf",crf,"-preset","medium","-pix_fmt","yuv420p10le","-fps_mode","cfr","-c:a","copy","-c:s","copy","-max_muxing_queue_size","4096","-map_metadata","0",str(output_path)], 86400)
-
-def run_encode_worker(job_id: str, chat_id: int, source_url: str) -> None:
-    process_encode_task(job_id, chat_id, source_url)
+        user_id = int(parts[1])
+    except ValueError:
+        return None
+    return user_id, parts[2] if len(parts) > 2 else ""
 
 
-def job_workspace(job_id: str) -> tuple[Path, Path]:
-    job_dir = JOBS_DIR / job_id
-    scratch = job_dir / "scratch"
-    job_dir.mkdir(parents=True, exist_ok=True)
-    scratch.mkdir(parents=True, exist_ok=True)
-    return job_dir, scratch
-
-
-QUEUE_FILE = DATA_DIR / "queue.json"
-ACTIVE_FILE = DATA_DIR / "active_job.json"
-QUEUE_LOCK = DATA_DIR / ".queue.lock"
-QUEUE_LIMIT = 100
-
-def _queue_lock(fn):
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
+async def expiry_loop() -> None:
     while True:
-        try:
-            QUEUE_LOCK.mkdir(); break
-        except FileExistsError: time.sleep(0.05)
-    try: return fn()
-    finally: shutil.rmtree(QUEUE_LOCK, ignore_errors=True)
+        now = time.time()
+        expired = [key for key, deadline in expiry.items() if deadline <= now]
+        for chat_id, message_id in expired:
+            delete_message(chat_id, message_id)
+            expiry.pop((chat_id, message_id), None)
 
-def load_queue() -> list[dict[str, Any]]:
-    try:
-        value=json.loads(QUEUE_FILE.read_text(encoding="utf-8")); return value if isinstance(value,list) else []
-    except Exception: return []
+        stale = [
+            message_id
+            for message_id, (_, created) in routes.items()
+            if now - created > DELETE_AFTER
+        ]
+        for message_id in stale:
+            routes.pop(message_id, None)
 
-def save_queue(items:list[dict[str,Any]])->None:
-    tmp=QUEUE_FILE.with_suffix(".tmp"); tmp.write_text(json.dumps(items,ensure_ascii=False),encoding="utf-8"); os.replace(tmp,QUEUE_FILE)
-
-def get_active_job()->dict[str,Any]|None:
-    try:
-        value=json.loads(ACTIVE_FILE.read_text(encoding="utf-8")); return value if isinstance(value,dict) else None
-    except Exception:return None
-
-def enqueue_job(job:dict[str,Any])->int:
-    def op():
-        items=load_queue()
-        if len(items)>=QUEUE_LIMIT: raise RuntimeError("FIFO queue is full")
-        items.append(job); save_queue(items); return len(items)
-    return _queue_lock(op)
-
-def claim_next_job()->dict[str,Any]|None:
-    def op():
-        if get_active_job() is not None:return None
-        items=load_queue()
-        if not items:return None
-        job=items.pop(0); ACTIVE_FILE.write_text(json.dumps(job),encoding="utf-8"); save_queue(items); return job
-    return _queue_lock(op)
-
-def release_active(job_id:str)->None:
-    def op():
-        active=get_active_job()
-        if active and active.get("job_id")==job_id: ACTIVE_FILE.unlink(missing_ok=True)
-    _queue_lock(op)
-
-def queue_position(job_id:str)->int:
-    for index,item in enumerate(load_queue(),1):
-        if item.get("job_id")==job_id:return index
-    return 0
-
-def dispatch_next()->None:
-    job=claim_next_job()
-    if not job:return
-    args=(job["job_id"],int(job["chat_id"]),*job["args"])
-    try:
-        if job["kind"]=="encode_x265": process_encode_task.spawn(*args)
-        elif job["kind"]=="remaster_1080p": process_remaster_task.spawn(*args,False)
-        elif job["kind"]=="remaster_4k": process_remaster_task.spawn(*args,True)
-        else: raise RuntimeError("Unknown queued job type")
-    except Exception:
-        release_active(job["job_id"]); enqueue_job(job); raise
-
-def finish_job(job_id:str)->None:
-    release_active(job_id)
-    try: dispatch_next()
-    except Exception as exc: print(f"Queue dispatch error: {exc}",file=sys.stderr)
-
-def execute_media_job(job_id:str,chat_id:int,name:str,sources:list[str],processor,filename:str,stage3:str)->None:
-    media_volume.reload()
-    job_dir,scratch=job_workspace(job_id)
-    output_dir=job_dir/"output"
-    output_dir.mkdir(parents=True,exist_ok=True)
-    output=output_dir/filename
-    ui=LiveUI(chat_id,job_id,name)
-    stop=start_abort_watch(job_id)
-    try:
-        ui.start()
-        if len(sources)==2:
-            candidate=download_media(job_id,sources[0],scratch/"candidate",ui)
-            ui.update(2,"🔍 Inspecting media & extracting reference audio...",0,force=True)
-            reference=download_media(job_id,sources[1],scratch/"reference",ui)
-            reference_audio=extract_reference_audio(job_id,reference,scratch)
-            ui.update(3,"🎛️ Analyzing Waveforms & Drift...",0,force=True)
-            processor(reference_audio,candidate,output)
-        else:
-            source=download_media(job_id,sources[0],scratch/"source",ui)
-            ui.update(2,"🔍 Inspecting media...",0,force=True)
-            ui.update(3,stage3,0,force=True)
-            processor(source,output)
-        check_abort(job_id)
-        verify_output(output)
-        ui.update(4,"☁️ Uploading output to cloud hosts...",0,force=True)
-        links=upload_output(output)
-        if not links:
-            raise RuntimeError("Cloud upload returned no verified download links. Output retained at "+str(output))
-        ui.final("✅ Process Completed!\n\n"+f"📄 File: {output.name}\n📦 Verification: PASS\n🔗 Download Links:\n"+format_links(links))
-        output.unlink(missing_ok=True)
-    except JobCancelled:
-        cleanup_scratch(scratch)
-        ui.final("🛑 Process Cancelled by User. Scratch disk scrubbed.")
-    except Exception as exc:
-        ui.final(f"❌ {name} failed.\n\nJob: {job_id}\n⚠️ Output retained at: {output}\nError: {exc}")
-    finally:
-        stop.set()
-        cleanup_scratch(scratch)
-        clear_abort(job_id)
-        commit_volume(job_id)
-        finish_job(job_id)
-
-@app.function(image=base_image,volumes={str(DATA_DIR):media_volume},secrets=[telegram_secret,remote_secret],cpu=8,memory=32768,timeout=86400,max_containers=1)
-def process_encode_task(job_id:str,chat_id:int,source_url:str):
-    from app.encode import encode_to_mkv
-    execute_media_job(job_id,chat_id,"x265 Encode (3-5 GiB)",[source_url],lambda source,out:encode_to_mkv(source,out,target_min_gb=3.0,target_max_gb=5.0,max_attempts=3),"Vikky x265 Encode.mkv","⚙️ Original x265 Target-Size Encoding...")
-
-@app.function(image=base_image,volumes={str(DATA_DIR):media_volume},secrets=[telegram_secret,remote_secret],cpu=8,memory=32768,timeout=86400,max_containers=1)
-def process_remaster_task(job_id:str,chat_id:int,source_url:str,four_k:bool=False):
-    name="4K Theater Remaster" if four_k else "1080p Hybrid Remaster"; filename="Vikky 4K Theater Remaster.mkv" if four_k else "Vikky Hybrid Remaster 1080p.mkv"
-    execute_media_job(job_id,chat_id,name,[source_url],lambda source,out:run_ffmpeg_remaster(job_id,source,out,four_k),filename,"🎬 4K Theater Master / 30+ Filter Equivalent..." if four_k else "🎬 15+ Filter Hybrid Remaster...")
-
-def submit_job(chat_id:int,kind:str,args:list[str],dashboard_msg_id:int|None=None)->tuple[str,int]:
-    job_id=os.urandom(4).hex(); enqueue_job({"job_id":job_id,"chat_id":chat_id,"kind":kind,"args":args,"created_at":time.time(),"dashboard_msg_id":dashboard_msg_id})
-    try: dispatch_next()
-    except Exception as exc: print(f"Initial queue dispatch error: {exc}",file=sys.stderr)
-    active=get_active_job(); return job_id,(0 if active and active.get("job_id")==job_id else queue_position(job_id))
+        await asyncio.sleep(30)
 
 
-web_app = FastAPI(title="Vikky Movie AI Bot Control Plane")
+@web_app.on_event("startup")
+async def startup() -> None:
+    # Only /help is shown in the Telegram command menu.
+    tg(
+        "setMyCommands",
+        {
+            "commands": [
+                {
+                    "command": "help",
+                    "description": "Bot ela vadalo Telugu/Tenglish help",
+                }
+            ]
+        },
+    )
+    asyncio.create_task(expiry_loop())
 
 
 @web_app.get("/health")
-async def health_check() -> dict[str, str]:
+async def health() -> dict[str, Any]:
     return {
-        "status": "healthy",
-        "service": APP_NAME,
+        "ok": True,
+        "service": "telegram-relay",
+        "forward_protection": not forward_enabled,
+        "auto_delete_24h": auto_delete_enabled,
+        "storage": "ram-only",
     }
 
 
 @web_app.post("/webhook")
-async def telegram_webhook(request: Request) -> JSONResponse:
-    try: data=await request.json()
-    except Exception: return JSONResponse(status_code=200,content={"status":"ignored"})
-    callback=data.get("callback_query")
-    if callback:
-        cid=str(callback.get("id") or ""); payload=str(callback.get("data") or ""); msg=callback.get("message") or {}; chat_id=int((msg.get("chat") or {}).get("id") or 0)
-        if payload.startswith("refresh_"):
-            job_id=payload[8:]; active=get_active_job(); answer_callback(cid,"Refreshed! ⚡" if active and active.get("job_id")==job_id else "Job is not active")
-        elif payload.startswith("abort_"):
-            job_id=payload[6:]; active=get_active_job()
-            if active and active.get("job_id")==job_id and int(active.get("chat_id",-1))==chat_id:
-                request_abort(job_id); cleanup_scratch(JOBS_DIR/job_id/"scratch"); answer_callback(cid,"Cancellation requested"); edit_tg_message(chat_id,msg.get("message_id"),"🛑 Process Cancelled by User. Scratch disk scrubbed.",{"inline_keyboard":[]})
-            else: answer_callback(cid,"Job is not active")
-        else: answer_callback(cid)
-        return JSONResponse(status_code=200,content={"status":"ok"})
-    msg=data.get("message") or data.get("edited_message")
-    if not msg or "text" not in msg:return JSONResponse(status_code=200,content={"status":"ignored"})
-    chat_id=int((msg.get("chat") or {}).get("id") or 0); text=str(msg.get("text") or "").strip()
-    if text in {"/start","/help"}:
-        clear_user_state(chat_id); send_tg_message(chat_id,"🤖 Vikky Movie AI Bot\n\nSelect a media operation:",menu=True); return JSONResponse(status_code=200,content={"status":"ok"})
-    if text in {"❌ Cancel / Reset","/cancel"}:
-        active=get_active_job()
-        if active and int(active.get("chat_id",-1))==chat_id: request_abort(str(active["job_id"]))
-        clear_user_state(chat_id); send_tg_message(chat_id,"🛑 Cancel / Reset requested.",menu=True); return JSONResponse(status_code=200,content={"status":"ok"})
-    if text=="📊 Cluster Status":
-        active=get_active_job(); pending=len(load_queue())
-        send_tg_message(chat_id,"🟢 Cluster Status: Online\n\nActive: "+str(active.get("job_id") if active else "None")+"\nPending FIFO: "+str(pending)+"\nWorkers: 8 CPU / 32 GB RAM / 86400s\nGPU: disabled\nStorage: /data\nConcurrency: 1",menu=True)
-        return JSONResponse(status_code=200,content={"status":"ok"})
-    prompts={"📦 x265 Encode (3-5 GiB)":"encode_x265","🎬 1080p Hybrid Remaster":"remaster_1080p","👑 4K Theater Remaster":"remaster_4k"}
-    if text in prompts:
-        dashboard_id=send_tg_message(chat_id,"📥 Please send the Video direct link:",menu=True)
-        set_user_state(chat_id,{"action":prompts[text],"step":"awaiting_video","dashboard_msg_id":dashboard_id})
-        return JSONResponse(status_code=200,content={"status":"awaiting_video"})
-    state=get_user_state(chat_id)
-    if state and state.get("step")=="awaiting_video" and state.get("action") in {"encode_x265","remaster_1080p","remaster_4k"}:
-        if not is_valid_url(text):
-            edit_tg_message(chat_id,state.get("dashboard_msg_id"),"❌ Invalid link. Please send a valid HTTP/HTTPS direct media link.",cancel_markup("pending")); return JSONResponse(status_code=200,content={"status":"invalid_url"})
-        dashboard_id=state.get("dashboard_msg_id"); action=str(state["action"])
-        delete_tg_message(chat_id,int(msg.get("message_id") or 0)); clear_user_state(chat_id)
-        job_id,pos=submit_job(chat_id,action,[text],dashboard_id)
-        edit_tg_message(chat_id,dashboard_id,("⏳ Task Added to Queue (Position: #"+str(pos)+")\nJob ID: "+job_id+"\nProcessing will automatically begin as soon as the active job completes.") if pos else "🎬 Task queued. Preparing the live dashboard…",cancel_markup(job_id))
-        return JSONResponse(status_code=200,content={"status":"queued","job_id":job_id})
-    send_tg_message(chat_id,"Please choose an operation from the menu below.",menu=True)
-    return JSONResponse(status_code=200,content={"status":"ignored"})
+async def webhook(request: Request) -> JSONResponse:
+    try:
+        update = await request.json()
+    except Exception:
+        return JSONResponse({"ok": True})
 
+    message = update.get("message") or update.get("edited_message")
+    if not message:
+        return JSONResponse({"ok": True})
 
-@web_app.get("/jobs")
-async def list_jobs(request: Request) -> JSONResponse:
-    authorization = request.headers.get("Authorization", "")
-    expected_token = os.environ.get("VIKKY_REMOTE_TOKEN", "")
+    chat = message.get("chat") or {}
+    chat_id = int(chat.get("id") or 0)
+    message_id = int(message.get("message_id") or 0)
+    if not chat_id or not message_id:
+        return JSONResponse({"ok": True})
 
-    if not expected_token or authorization != f"Bearer {expected_token}":
-        return JSONResponse(
-            status_code=401,
-            content={"error": "Unauthorized"},
-        )
+    user = message.get("from") or {}
+    text = str(message.get("text") or message.get("caption") or "").strip()
 
-    jobs_data: list[dict[str, Any]] = []
+    # OWNER SIDE
+    if chat_id == OWNER_ID:
+        if text.lower() == "/help":
+            sent = send_text(OWNER_ID, owner_help(), protect_content=True)
+            remember_message(OWNER_ID, int(sent["message_id"]))
+            return JSONResponse({"ok": True})
 
-    if JOBS_DIR.exists():
-        for path in sorted(JOBS_DIR.iterdir(), key=lambda p: p.name):
-            if not path.is_dir():
-                continue
+        if text.lower().startswith("/forward "):
+            value = text.split(maxsplit=1)[1].strip().lower()
+            if value in {"on", "off"}:
+                global forward_enabled
+                forward_enabled = value == "on"
+                state = "OFF (forward allowed)" if forward_enabled else "ON (forward/save blocked)"
+                sent = send_text(
+                    OWNER_ID,
+                    f"Forward protection: {state}",
+                    protect_content=True,
+                )
+                remember_message(OWNER_ID, int(sent["message_id"]))
+            return JSONResponse({"ok": True})
 
-            jobs_data.append(
-                {
-                    "job_id": path.name,
-                    "retained_files": sorted(
-                        file.name
-                        for file in path.iterdir()
-                        if file.is_file()
-                    ),
-                }
-            )
+        if text.lower().startswith("/24h "):
+            value = text.split(maxsplit=1)[1].strip().lower()
+            if value in {"on", "off"}:
+                global auto_delete_enabled
+                auto_delete_enabled = value == "on"
+                if not auto_delete_enabled:
+                    expiry.clear()
+                sent = send_text(
+                    OWNER_ID,
+                    "24h auto delete: " + ("ON" if auto_delete_enabled else "OFF"),
+                    protect_content=True,
+                )
+                remember_message(OWNER_ID, int(sent["message_id"]))
+            return JSONResponse({"ok": True})
 
-    return JSONResponse(
-        content={
-            "status": "ok",
-            "jobs": jobs_data,
-        }
+        parsed = parse_to(text)
+        if parsed:
+            target_id, body = parsed
+            if body:
+                sent = send_text(target_id, body, protect_content=protect())
+                remember_message(target_id, int(sent["message_id"]))
+            elif any(
+                message.get(key)
+                for key in ("photo", "video", "document", "audio", "voice", "animation", "sticker")
+            ):
+                copied = copy_message(target_id, OWNER_ID, message_id)
+                remember_message(target_id, int(copied["message_id"]))
+            else:
+                sent = send_text(
+                    OWNER_ID,
+                    "Format: /to USER_ID MESSAGE",
+                    protect_content=True,
+                )
+                remember_message(OWNER_ID, int(sent["message_id"]))
+            remember_message(OWNER_ID, message_id)
+            return JSONResponse({"ok": True})
+
+        reply = message.get("reply_to_message") or {}
+        route = routes.get(int(reply.get("message_id") or 0))
+        if route:
+            target_id, _ = route
+            copied = copy_message(target_id, OWNER_ID, message_id)
+            remember_message(target_id, int(copied["message_id"]))
+            remember_message(OWNER_ID, message_id)
+            return JSONResponse({"ok": True})
+
+        # Owner messages without /to or Reply are not broadcast.
+        return JSONResponse({"ok": True})
+
+    # USER SIDE
+    if text.lower() == "/help":
+        sent = send_text(chat_id, help_user(), protect_content=True)
+        remember_message(chat_id, int(sent["message_id"]))
+        remember_message(chat_id, message_id)
+        return JSONResponse({"ok": True})
+
+    header = send_text(
+        OWNER_ID,
+        "📩 New private message\n"
+        + user_label(user)
+        + "\n\n↩️ Reply to this header or the copied message to answer.",
+        protect_content=True,
     )
+    header_id = int(header["message_id"])
+    routes[header_id] = (chat_id, time.time())
+    remember_message(OWNER_ID, header_id)
+
+    try:
+        copied = copy_message(OWNER_ID, chat_id, message_id)
+        copied_id = int(copied["message_id"])
+        routes[copied_id] = (chat_id, time.time())
+        remember_message(OWNER_ID, copied_id)
+    except Exception as exc:
+        error = send_text(
+            OWNER_ID,
+            f"⚠️ Could not relay message from {chat_id}: {exc}",
+            protect_content=True,
+        )
+        remember_message(OWNER_ID, int(error["message_id"]))
+
+    # No local file/database copy is made.
+    remember_message(chat_id, message_id)
+    return JSONResponse({"ok": True})
 
 
 @app.function(
-    image=base_image,
-    secrets=[telegram_secret, remote_secret],
+    image=image,
+    secrets=[telegram_secret],
     min_containers=1,
-    max_containers=2,
+    max_containers=1,
     scaledown_window=300,
+    timeout=86400,
 )
 @modal.asgi_app()
 def api():
