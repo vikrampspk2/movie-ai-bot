@@ -175,6 +175,7 @@ async def health() -> dict[str, Any]:
 
 @web_app.post("/webhook")
 async def webhook(request: Request) -> JSONResponse:
+    global forward_enabled, auto_delete_enabled
     try:
         update = await request.json()
     except Exception:
@@ -203,7 +204,6 @@ async def webhook(request: Request) -> JSONResponse:
         if text.lower().startswith("/forward "):
             value = text.split(maxsplit=1)[1].strip().lower()
             if value in {"on", "off"}:
-                global forward_enabled
                 forward_enabled = value == "on"
                 state = "OFF (forward allowed)" if forward_enabled else "ON (forward/save blocked)"
                 sent = send_text(
@@ -217,7 +217,6 @@ async def webhook(request: Request) -> JSONResponse:
         if text.lower().startswith("/24h "):
             value = text.split(maxsplit=1)[1].strip().lower()
             if value in {"on", "off"}:
-                global auto_delete_enabled
                 auto_delete_enabled = value == "on"
                 if not auto_delete_enabled:
                     expiry.clear()
