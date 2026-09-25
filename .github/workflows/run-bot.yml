@@ -6,7 +6,11 @@ on:
       - main
   workflow_dispatch:
   schedule:
-    - cron: '0 */5 * * *' # Auto-restarts every 5 hours before GitHub 6h runner limit
+    - cron: '0 */5 * * *'
+
+concurrency:
+  group: telegram-bot-runner
+  cancel-in-progress: true
 
 jobs:
   run-bot:
@@ -24,7 +28,7 @@ jobs:
         run: |
           pip install httpx
 
-      - name: Run Bot (Continuous Polling)
+      - name: Run Bot
         env:
           BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         run: |
