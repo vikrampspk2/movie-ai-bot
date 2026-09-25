@@ -97,7 +97,7 @@ async def handle_message(msg: dict):
                 "• `/delete24h_on` - Enable 24h message deletion\n"
                 "• `/delete24h_off` - Disable 24h message deletion\n\n"
                 "📤 *How to Message Users:*\n"
-                "1. **Direct Reply:** Relayed మెసేజ్ కి టెలిగ్రామ్ లో డైరెక్ట్ గా Reply ఇవ్వండి.\n"
+                "1. **Direct Reply:** Relayed മെസേജ് కి టెలిగ్రామ్ లో డైరెక్ట్ గా Reply ఇవ్వండి.\n"
                 "2. **Media + User ID:** మీరు ఏదైనా ఫోటో/వీడియో/ఫైల్ పంపి, ఆ మెసేజ్ కి Reply గా కేవలం వాడి User ID టైప్ చేసి సెండ్ చేయండి.\n"
                 "3. **Text Command:** `/to <user_id> <message>`"
             )
