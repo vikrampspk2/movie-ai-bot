@@ -1,215 +1,257 @@
 import os
 import sys
 import time
+import asyncio
 import httpx
 
 OWNER_ID = 8742037337
 TELEGRAM_API = "https://api.telegram.org/bot"
 
-# Routing memory: { relayed_bot_msg_id: {"user_id": int, "created_at": float} }
+TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN") or os.environ.get("BOT_TOKEN") or ""
+if not TOKEN:
+    print("FATAL: No BOT_TOKEN found in Secrets!")
+    sys.exit(1)
+
+# In-memory routing and settings
+# message_route: { owner_received_msg_id: target_user_id }
 message_route = {}
+# media_route: { owner_sent_msg_id: timestamp }
+owner_recent_media = {}
+
 settings = {
     "protect_content": True,
     "auto_delete_24h": True
 }
 delete_queue = []
+processed_updates = set()
 
-TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN") or os.environ.get("BOT_TOKEN") or ""
+client = httpx.AsyncClient(timeout=25.0)
 
-if not TOKEN:
-    print("FATAL: No BOT_TOKEN found in Secrets!")
-    sys.exit(1)
-
-def call_tg(method: str, payload: dict) -> dict:
+async def call_tg(method: str, payload: dict) -> dict:
     url = f"{TELEGRAM_API}{TOKEN}/{method}"
     try:
-        with httpx.Client(timeout=30.0) as client:
-            res = client.post(url, json=payload)
-            return res.json()
+        res = await client.post(url, json=payload)
+        return res.json()
     except Exception as e:
         print(f"Error calling {method}: {e}")
         return {}
 
+async def register_commands():
+    # Set owner commands in Telegram Menu
+    owner_scope = {"type": "chat", "chat_id": OWNER_ID}
+    owner_cmds = [
+        {"command": "help", "description": "👑 Control Panel & Status"},
+        {"command": "forward_on", "description": "🔒 Protect Media/Text (No Forward)"},
+        {"command": "forward_off", "description": "🔓 Allow Forwarding/Saving"},
+        {"command": "delete24h_on", "description": "⏳ Enable 24h Auto-Delete"},
+        {"command": "delete24h_off", "description": "♾️ Disable Auto-Delete"}
+    ]
+    await call_tg("setMyCommands", {"commands": owner_cmds, "scope": owner_scope})
+
+    # Set default user commands
+    default_cmds = [
+        {"command": "help", "description": "Help & Instructions"}
+    ]
+    await call_tg("setMyCommands", {"commands": default_cmds})
+
 def cleanup():
     now = time.time()
-    # Expire old routes
-    expired = [m for m, d in message_route.items() if now - d.get("created_at", 0) > 172800]
-    for m in expired:
-        message_route.pop(m, None)
+    # Expire old updates set (prevent memory leak)
+    if len(processed_updates) > 5000:
+        processed_updates.clear()
     
-    # Process 24h delete queue
+    # Process 24h deletion queue
     for item in list(delete_queue):
-        c_id, m_id, t_time = item
-        if now >= t_time:
-            call_tg("deleteMessage", {"chat_id": c_id, "message_id": m_id})
+        c_id, m_id, expire_at = item
+        if now >= expire_at:
+            asyncio.create_task(call_tg("deleteMessage", {"chat_id": c_id, "message_id": m_id}))
             if item in delete_queue:
                 delete_queue.remove(item)
 
-# First delete any existing webhook so polling works
-print("Deleting webhook for polling...")
-call_tg("deleteWebhook", {"drop_pending_updates": False})
+async def handle_message(msg: dict):
+    msg_id = msg.get("message_id")
+    chat_id = msg.get("chat", {}).get("id")
+    from_user = msg.get("from", {})
+    user_id = from_user.get("id")
+    text = (msg.get("text") or msg.get("caption") or "").strip()
+    reply_to = msg.get("reply_to_message")
+    protect = settings["protect_content"]
 
-print("Bot is LIVE and listening for messages...")
-offset = 0
+    is_owner = (str(user_id) == str(OWNER_ID))
 
-while True:
-    try:
-        cleanup()
-        res = call_tg("getUpdates", {"offset": offset, "timeout": 20})
-        if not res.get("ok"):
-            time.sleep(2)
-            continue
+    # ===================================================
+    # 1. OWNER CONTROLS & SENDING
+    # ===================================================
+    if is_owner:
+        cmd = text.lower()
 
-        updates = res.get("result", [])
-        for update in updates:
-            offset = update["update_id"] + 1
-            if "message" not in update:
-                continue
+        # Help / Status
+        if cmd in ["/help", "/start"]:
+            help_text = (
+                "👑 *Owner Control Panel*\n\n"
+                f"🔒 *Forward Protection:* `{'ON' if settings['protect_content'] else 'OFF'}`\n"
+                f"⏳ *24h Auto-Delete:* `{'ON' if settings['auto_delete_24h'] else 'OFF'}`\n\n"
+                "⚙️ *Menu Commands:*\n"
+                "• `/forward_on` - Stop users from forwarding/saving\n"
+                "• `/forward_off` - Allow users to forward/save\n"
+                "• `/delete24h_on` - Enable 24h message deletion\n"
+                "• `/delete24h_off` - Disable 24h message deletion\n\n"
+                "📤 *How to Message Users:*\n"
+                "1. **Direct Reply:** Relayed మెసేజ్ కి టెలిగ్రామ్ లో డైరెక్ట్ గా Reply ఇవ్వండి.\n"
+                "2. **Media + User ID:** మీరు ఏదైనా ఫోటో/వీడియో/ఫైల్ పంపి, ఆ మెసేజ్ కి Reply గా కేవలం వాడి User ID టైప్ చేసి సెండ్ చేయండి.\n"
+                "3. **Text Command:** `/to <user_id> <message>`"
+            )
+            await call_tg("sendMessage", {"chat_id": OWNER_ID, "text": help_text, "parse_mode": "Markdown"})
+            return
 
-            msg = update["message"]
-            chat_id = msg.get("chat", {}).get("id")
-            from_user = msg.get("from", {})
-            user_id = from_user.get("id")
-            text = (msg.get("text") or msg.get("caption") or "").strip()
-            reply_to = msg.get("reply_to_message")
-            protect = settings["protect_content"]
+        # Settings: Forward Protection
+        if cmd in ["/forward_on", "/forward on"]:
+            settings["protect_content"] = True
+            await call_tg("sendMessage", {"chat_id": OWNER_ID, "text": "✅ *Forward Protection is ON* (Users cannot save/forward).", "parse_mode": "Markdown"})
+            return
+        elif cmd in ["/forward_off", "/forward off"]:
+            settings["protect_content"] = False
+            await call_tg("sendMessage", {"chat_id": OWNER_ID, "text": "⚠️ *Forward Protection is OFF* (Users can save/forward).", "parse_mode": "Markdown"})
+            return
 
-            # Strict string-based Owner Check
-            is_owner = (str(user_id) == str(OWNER_ID))
+        # Settings: 24h Auto Delete
+        if cmd in ["/delete24h_on", "/24h on"]:
+            settings["auto_delete_24h"] = True
+            await call_tg("sendMessage", {"chat_id": OWNER_ID, "text": "✅ *24-Hour Auto-Delete is ON*.", "parse_mode": "Markdown"})
+            return
+        elif cmd in ["/delete24h_off", "/24h off"]:
+            settings["auto_delete_24h"] = False
+            await call_tg("sendMessage", {"chat_id": OWNER_ID, "text": "⚠️ *24-Hour Auto-Delete is OFF*.", "parse_mode": "Markdown"})
+            return
 
-            # ==========================================
-            # 1. OWNER CONTROLS & DISPATCH
-            # ==========================================
-            if is_owner:
-                cmd = text.lower()
+        # Manual /to command
+        if text.startswith("/to "):
+            parts = text.split(maxsplit=2)
+            if len(parts) >= 3:
+                target = parts[1].strip()
+                body = parts[2]
+                res = await call_tg("sendMessage", {"chat_id": target, "text": body, "protect_content": protect})
+                if res.get("ok"):
+                    await call_tg("sendMessage", {"chat_id": OWNER_ID, "text": f"✅ Delivered to `{target}`", "parse_mode": "Markdown"})
+                    if settings["auto_delete_24h"]:
+                        delete_queue.append((int(target), res["result"]["message_id"], time.time() + 86400))
+                else:
+                    await call_tg("sendMessage", {"chat_id": OWNER_ID, "text": f"❌ Delivery failed to `{target}`. Check if user started bot."})
+            return
 
-                # Owner Help
-                if cmd == "/help":
-                    help_text = (
-                        "👑 *Owner Control Panel*\n\n"
-                        "⚙️ *Settings Toggles:*\n"
-                        "• `/forward on` / `/forward off` - Forward protection\n"
-                        "• `/24h on` / `/24h off` - 24 Hours auto delete\n\n"
-                        "📤 *How to Send to Users:*\n"
-                        "1. *File/Media to User:* Nuvvu edhaina File/Photo/Video send chesi, daaniki *Reply* ga vadi User ID type chesthe, aa file vadiki vellipothundi.\n"
-                        "2. *Normal Reply:* Relayed message ki direct ga Telegram Reply cheyandi.\n"
-                        "3. *Command:* `/to <user_id> <message>`\n\n"
-                        f"📊 *Current Status:*\n"
-                        f"• Forward Protection: `{'ON' if settings['protect_content'] else 'OFF'}`\n"
-                        f"• 24h Auto-Delete: `{'ON' if settings['auto_delete_24h'] else 'OFF'}`"
-                    )
-                    call_tg("sendMessage", {"chat_id": OWNER_ID, "text": help_text, "parse_mode": "Markdown"})
-                    continue
+        # Check Reply Cases
+        if reply_to:
+            target_msg_id = reply_to.get("message_id")
 
-                # Forward Protection Toggle
-                if cmd == "/forward on":
-                    settings["protect_content"] = True
-                    call_tg("sendMessage", {"chat_id": OWNER_ID, "text": "✅ *Forward Protection is now ON* (Users cannot save/forward messages/media).", "parse_mode": "Markdown"})
-                    continue
-                elif cmd == "/forward off":
-                    settings["protect_content"] = False
-                    call_tg("sendMessage", {"chat_id": OWNER_ID, "text": "⚠️ *Forward Protection is now OFF* (Users can save/forward messages).", "parse_mode": "Markdown"})
-                    continue
-
-                # 24 Hours Auto Delete Toggle
-                if cmd == "/24h on":
-                    settings["auto_delete_24h"] = True
-                    call_tg("sendMessage", {"chat_id": OWNER_ID, "text": "✅ *24-Hour Auto-Delete is now ON* (Messages delete automatically after 24h).", "parse_mode": "Markdown"})
-                    continue
-                elif cmd == "/24h off":
-                    settings["auto_delete_24h"] = False
-                    call_tg("sendMessage", {"chat_id": OWNER_ID, "text": "⚠️ *24-Hour Auto-Delete is now OFF*.", "parse_mode": "Markdown"})
-                    continue
-
-                # Send via /to command
-                if text.startswith("/to "):
-                    parts = text.split(maxsplit=2)
-                    if len(parts) >= 3:
-                        target = parts[1].strip()
-                        body = parts[2]
-                        res_send = call_tg("sendMessage", {"chat_id": target, "text": body, "protect_content": protect})
-                        if res_send.get("ok"):
-                            call_tg("sendMessage", {"chat_id": OWNER_ID, "text": f"✅ Message sent to `{target}`", "parse_mode": "Markdown"})
-                            if settings["auto_delete_24h"]:
-                                delete_queue.append((int(target), res_send["result"]["message_id"], time.time() + 86400))
-                        else:
-                            call_tg("sendMessage", {"chat_id": OWNER_ID, "text": f"❌ Failed to send to `{target}`. Check User ID."})
-                    continue
-
-                # Reply based dispatch
-                if reply_to:
-                    # Case A: Owner replies with a User ID to a previously uploaded file/media
-                    if text.isdigit() and len(text) >= 6:
-                        target_user = int(text)
-                        original_msg_id = reply_to.get("message_id")
-                        res_copy = call_tg("copyMessage", {
-                            "chat_id": target_user,
-                            "from_chat_id": OWNER_ID,
-                            "message_id": original_msg_id,
-                            "protect_content": protect
-                        })
-                        if res_copy.get("ok"):
-                            call_tg("sendMessage", {"chat_id": OWNER_ID, "text": f"✅ Media/File successfully forwarded to `{target_user}`!", "parse_mode": "Markdown"})
-                            if settings["auto_delete_24h"]:
-                                delete_queue.append((target_user, res_copy["result"]["message_id"], time.time() + 86400))
-                                delete_queue.append((OWNER_ID, original_msg_id, time.time() + 86400))
-                        else:
-                            call_tg("sendMessage", {"chat_id": OWNER_ID, "text": f"❌ Could not forward media to `{target_user}`. Has the user started the bot?"})
-                        continue
-
-                    # Case B: Owner replies to a relayed message from a user
-                    r_id = reply_to.get("message_id")
-                    route = message_route.get(r_id)
-                    if route:
-                        target_user = route["user_id"]
-                        res_copy = call_tg("copyMessage", {
-                            "chat_id": target_user,
-                            "from_chat_id": OWNER_ID,
-                            "message_id": msg["message_id"],
-                            "protect_content": protect
-                        })
-                        if res_copy.get("ok"):
-                            if settings["auto_delete_24h"]:
-                                delete_queue.append((target_user, res_copy["result"]["message_id"], time.time() + 86400))
-                                delete_queue.append((OWNER_ID, msg["message_id"], time.time() + 86400))
-                        else:
-                            call_tg("sendMessage", {"chat_id": OWNER_ID, "text": "❌ Reply sending failed."})
-                        continue
-
-            # ==========================================
-            # 2. NORMAL USERS RELAY TO OWNER
-            # ==========================================
-            else:
-                # Block commands from normal users
-                if text.startswith("/"):
-                    if text.strip() == "/help" or text.strip() == "/start":
-                        help_msg = (
-                            "🤖 *Bot Support*\n\n"
-                            "Mee message, photo, video, file, voice direct ga relay avuthundi.\n"
-                            "Owner reply isthe meeku direct ga ikkade deliver avuthundi."
-                        )
-                        call_tg("sendMessage", {"chat_id": chat_id, "text": help_msg, "parse_mode": "Markdown"})
-                    continue
-
-                full_name = f"{from_user.get('first_name', '')} {from_user.get('last_name', '')}".strip()
-                username = f"@{from_user.get('username')}" if from_user.get('username') else "None"
-                header = f"📩 *New Message*\n\n👤 *From:* {full_name}\n🆔 *User ID:* `{user_id}`\n🔗 *Username:* {username}"
-                call_tg("sendMessage", {"chat_id": OWNER_ID, "text": header, "parse_mode": "Markdown"})
-
-                relayed = call_tg("copyMessage", {
-                    "chat_id": OWNER_ID,
-                    "from_chat_id": chat_id,
-                    "message_id": msg["message_id"],
+            # Case A: Owner replies with only User ID to a previously uploaded file/photo/text
+            clean_digits = "".join(filter(str.isdigit, text))
+            if text.isdigit() and len(clean_digits) >= 6:
+                target_user = int(clean_digits)
+                res = await call_tg("copyMessage", {
+                    "chat_id": target_user,
+                    "from_chat_id": OWNER_ID,
+                    "message_id": target_msg_id,
                     "protect_content": protect
                 })
-
-                if relayed.get("ok"):
-                    r_msg_id = relayed["result"]["message_id"]
-                    message_route[r_msg_id] = {"user_id": user_id, "created_at": time.time()}
+                if res.get("ok"):
+                    await call_tg("sendMessage", {"chat_id": OWNER_ID, "text": f"✅ Sent directly to `{target_user}`!", "parse_mode": "Markdown"})
                     if settings["auto_delete_24h"]:
-                        delete_queue.append((OWNER_ID, r_msg_id, time.time() + 86400))
-                        delete_queue.append((chat_id, msg["message_id"], time.time() + 86400))
+                        delete_queue.append((target_user, res["result"]["message_id"], time.time() + 86400))
+                        delete_queue.append((OWNER_ID, target_msg_id, time.time() + 86400))
+                else:
+                    await call_tg("sendMessage", {"chat_id": OWNER_ID, "text": f"❌ Failed to forward to `{target_user}`."})
+                return
 
-    except Exception as err:
-        print(f"Loop iteration error: {err}")
-        time.sleep(2)
+            # Case B: Owner directly replies to an incoming user message
+            if target_msg_id in message_route:
+                target_user = message_route[target_msg_id]
+                res = await call_tg("copyMessage", {
+                    "chat_id": target_user,
+                    "from_chat_id": OWNER_ID,
+                    "message_id": msg_id,
+                    "protect_content": protect
+                })
+                if res.get("ok"):
+                    if settings["auto_delete_24h"]:
+                        delete_queue.append((target_user, res["result"]["message_id"], time.time() + 86400))
+                        delete_queue.append((OWNER_ID, msg_id, time.time() + 86400))
+                else:
+                    await call_tg("sendMessage", {"chat_id": OWNER_ID, "text": "❌ Reply sending failed."})
+                return
+
+    # ===================================================
+    # 2. NORMAL USERS -> RELAY TO OWNER (Single Clean Message)
+    # ===================================================
+    else:
+        if text in ["/start", "/help"]:
+            await call_tg("sendMessage", {
+                "chat_id": chat_id,
+                "text": "👋 Welcome! Send any message, photo, video, or file. It will be privately delivered to the admin."
+            })
+            return
+
+        # Prepare clear header
+        full_name = f"{from_user.get('first_name', '')} {from_user.get('last_name', '')}".strip()
+        username = f"@{from_user.get('username')}" if from_user.get('username') else "No username"
+
+        # Copy message directly to owner
+        relayed = await call_tg("copyMessage", {
+            "chat_id": OWNER_ID,
+            "from_chat_id": chat_id,
+            "message_id": msg_id,
+            "protect_content": protect
+        })
+
+        if relayed.get("ok"):
+            r_msg_id = relayed["result"]["message_id"]
+            message_route[r_msg_id] = user_id
+
+            # Send single notification to owner so they can reply directly
+            info_text = f"📩 *From:* {full_name} | `{user_id}` | {username}\n_(Reply to this or the message above to answer)_"
+            info_res = await call_tg("sendMessage", {
+                "chat_id": OWNER_ID,
+                "text": info_text,
+                "parse_mode": "Markdown",
+                "reply_to_message_id": r_msg_id
+            })
+            if info_res.get("ok"):
+                info_id = info_res["result"]["message_id"]
+                message_route[info_id] = user_id
+
+            if settings["auto_delete_24h"]:
+                delete_queue.append((OWNER_ID, r_msg_id, time.time() + 86400))
+                delete_queue.append((chat_id, msg_id, time.time() + 86400))
+
+async def main():
+    print("Deleting old webhooks...")
+    await call_tg("deleteWebhook", {"drop_pending_updates": True})
+    await register_commands()
+    print("Bot loop started with pure async polling...")
+
+    offset = 0
+    while True:
+        try:
+            cleanup()
+            res = await call_tg("getUpdates", {"offset": offset, "timeout": 15})
+            if not res.get("ok"):
+                await asyncio.sleep(1)
+                continue
+
+            updates = res.get("result", [])
+            for update in updates:
+                up_id = update["update_id"]
+                offset = up_id + 1
+
+                if up_id in processed_updates:
+                    continue
+                processed_updates.add(up_id)
+
+                if "message" in update:
+                    asyncio.create_task(handle_message(update["message"]))
+
+        except Exception as e:
+            print(f"Error in main polling loop: {e}")
+            await asyncio.sleep(1)
+
+if __name__ == "__main__":
+    asyncio.run(main())
