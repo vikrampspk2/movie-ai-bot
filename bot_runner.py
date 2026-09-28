@@ -11,9 +11,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from time import monotonic
 
-from pyrogram import Client, filters
+from pyrogram import Client, StopPropagation, filters
+from pyrogram import raw
 from pyrogram.types import (
     BotCommand,
+    BotCommandScopeDefault,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -92,7 +94,18 @@ def _resolve_credentials() -> tuple[int, str, str, tuple[str, ...]]:
     if not bot_token: missing.append("BOT_TOKEN")
     return api_id, api_hash, bot_token, tuple(missing)
 
+def _resolve_owner_id() -> int:
+    names = ("OWNER_ID", "TELEGRAM_OWNER_ID", "ADMIN_ID", "TELEGRAM_ADMIN_ID")
+    dotenv_values = _read_dotenv_files()
+    raw_value = _first_value(names, dotenv_values)
+    try:
+        return int(raw_value) if raw_value else 0
+    except (TypeError, ValueError):
+        return 0
+
+
 API_ID, API_HASH, BOT_TOKEN, _MISSING_CREDENTIALS = _resolve_credentials()
+OWNER_ID = _resolve_owner_id()
 app = Client("vikky_bot", api_id=API_ID or 1, api_hash=API_HASH or "waiting-for-credentials", bot_token=BOT_TOKEN or "waiting-for-credentials", in_memory=True)
 
 URL_RE = re.compile(r"https?://[^\s<>\"]+")
@@ -462,6 +475,21 @@ async def cancel_queued_job(job: Job, query: CallbackQuery) -> None:
     await query.answer("Pani aapabadindi.")
 
 
+@app.on_message(filters.private, group=-1)
+async def access_and_debug_handler(_, message: Message) -> None:
+    user = message.from_user
+    user_id = user.id if user else 0
+    command_text = message.text or message.caption or ""
+    log.info("Incoming Telegram message | user_id=%s | text=%s", user_id, command_text[:500])
+
+    if OWNER_ID and user_id != OWNER_ID:
+        await message.reply_text(
+            f"Access Denied: Mee Telegram ID ({user_id}) authorized kadu. "
+            "Render Environment lo OWNER_ID check chesukondi."
+        )
+        raise StopPropagation
+
+
 @app.on_callback_query()
 async def callback_handler(_, query: CallbackQuery) -> None:
     data = query.data or ""
@@ -688,11 +716,20 @@ async def link_handler(_, message: Message) -> None:
 
 
 async def refresh_bot_commands() -> None:
-    # Mundu default menu ni clear chesi, kotha aidu commands matrame pedatham.
+    # Webhook ni polling mundu force ga clear chestham.
     try:
-        await app.delete_bot_commands()
+        await app.invoke(raw.functions.bots.DeleteWebhook(drop_pending_updates=True))
+        log.info("Telegram webhook clear ayyindi; pending updates drop ayyayi.")
     except Exception:
-        log.exception("Pata Telegram commands clear cheyyadam lo ibbandi.")
+        log.exception("Telegram webhook clear cheyyadam lo ibbandi.")
+        raise
+
+    scope = BotCommandScopeDefault()
+    try:
+        await app.delete_bot_commands(scope=scope)
+    except Exception:
+        log.exception("Pata default Telegram commands clear cheyyadam lo ibbandi.")
+        raise
 
     commands = [
         BotCommand("start", "Bot prarambha vivaralu"),
@@ -701,8 +738,8 @@ async def refresh_bot_commands() -> None:
         BotCommand("encode", "Tvarita video encode"),
         BotCommand("upscale", "4K video AI upscale"),
     ]
-    await app.set_bot_commands(commands)
-    log.info("Telegram command menu kothaga set ayyindi.")
+    await app.set_bot_commands(commands, scope=scope)
+    log.info("Telegram default command menu force update ayyindi.")
 
 
 async def main() -> None:
