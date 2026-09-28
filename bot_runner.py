@@ -3,17 +3,16 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import time
-from collections import deque
-from typing import Any
+import re
+import tempfile
+from pathlib import Path
 
 from pyrogram import Client, filters
 from pyrogram.types import Message
 
-try:
-    from kaggle.api.kaggle_api_extended import KaggleApi
-except Exception:
-    KaggleApi = None
+from app.encode import EncodeError, encode_to_mkv
+from app.media.downloader import DownloadError, download_url
+from app.uploaders import upload_to_all
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -24,13 +23,16 @@ log = logging.getLogger("vikky-bot")
 API_ID = int(os.getenv("PYROGRAM_API_ID") or os.getenv("API_ID") or "0")
 API_HASH = os.getenv("PYROGRAM_API_HASH") or os.getenv("API_HASH") or ""
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN") or ""
-OWNER_ID = int(os.getenv("OWNER_ID", "8742037337"))
+DEFAULT_JOB_TYPE = os.getenv("DEFAULT_JOB_TYPE", "encode").lower()
 
 if not API_ID or not API_HASH or not BOT_TOKEN:
     raise RuntimeError(
-        "Missing Telegram credentials: PYROGRAM_API_ID, "
-        "PYROGRAM_API_HASH and TELEGRAM_BOT_TOKEN are required."
+        "Telegram credentials levu. PYROGRAM_API_ID, PYROGRAM_API_HASH "
+        "mariyu TELEGRAM_BOT_TOKEN set cheyyali."
     )
+
+if DEFAULT_JOB_TYPE not in {"encode", "upscale"}:
+    DEFAULT_JOB_TYPE = "encode"
 
 app = Client(
     "vikky_bot",
@@ -40,214 +42,248 @@ app = Client(
     in_memory=True,
 )
 
-message_route: dict[int, int] = {}
-delete_queue: deque[tuple[int, int, float]] = deque()
-
-settings = {
-    "protect_content": True,
-    "auto_delete_24h": True,
-}
-
-_kaggle_api: Any = None
+URL_RE = re.compile(r"https?://[^\s<>\"]+")
+active_jobs: dict[int, dict[str, object]] = {}
 
 
-def get_kaggle_api() -> Any:
-    global _kaggle_api
-    if _kaggle_api is not None:
-        return _kaggle_api
-    if KaggleApi is None:
+def find_url(text: str) -> str | None:
+    match = URL_RE.search(text or "")
+    if not match:
         return None
-    try:
-        api = KaggleApi()
-        api.authenticate()
-        _kaggle_api = api
-        log.info("Kaggle API authenticated")
-        return api
-    except Exception as exc:
-        log.warning("Kaggle API unavailable: %s", exc)
-        return None
+    return match.group(0).rstrip(".,);]}>\"'")
 
 
-async def kaggle_status() -> str:
-    api = await asyncio.to_thread(get_kaggle_api)
-    if api is None:
-        return "Kaggle API is not authenticated/configured."
-    try:
-        user = await asyncio.to_thread(api.get_current_user)
-        username = getattr(user, "username", None) or getattr(user, "name", None) or "authenticated"
-        return f"Kaggle API connected: {username}"
-    except Exception as exc:
-        log.warning("Kaggle status failed: %s", exc)
-        return "Kaggle credentials are present, but the API check failed."
+async def send_status(chat_id: int, text: str) -> Message:
+    return await app.send_message(chat_id, text)
 
 
-def schedule_delete(chat_id: int, message_id: int) -> None:
-    if settings["auto_delete_24h"]:
-        delete_queue.append((chat_id, message_id, time.time() + 86400))
-
-
-async def cleanup_loop() -> None:
+async def job_heartbeat(chat_id: int, job_id: str) -> None:
     while True:
+        await asyncio.sleep(20)
+        job = active_jobs.get(chat_id)
+        if not job or job.get("id") != job_id:
+            return
+        stage = str(job.get("stage", "processing"))
+        await send_status(
+            chat_id,
+            f"⏳ Ippudu {stage} stage lo pani jarugutondi.\n"
+            "Konchem samayam padutundi; process background lo continue avuthundi.",
+        )
+
+
+async def process_link(chat_id: int, url: str, job_id: str) -> None:
+    work_dir = Path(tempfile.mkdtemp(prefix=f"vikky-{job_id}-"))
+    job = active_jobs[chat_id]
+
+    heartbeat = asyncio.create_task(job_heartbeat(chat_id, job_id))
+    try:
+        job["stage"] = "download"
+        await send_status(
+            chat_id,
+            "🔗 Link dorikindi.\n"
+            "📥 Movie ni fast ga download cheyyadam start chesanu.",
+        )
+
+        source = await download_url(url, work_dir)
+        job["source"] = str(source)
+        job["stage"] = "processing"
+
+        await send_status(
+            chat_id,
+            "✅ Download complete.\n"
+            "🎬 Ippudu movie processing start ayyindi.",
+        )
+
+        if DEFAULT_JOB_TYPE == "upscale":
+            # Real AI upscale needs the configured GPU backend. Do not fake completion.
+            raise RuntimeError(
+                "AI upscale backend inka configure cheyyaledu. "
+                "DEFAULT_JOB_TYPE=encode tho encoding automatic ga run cheyyandi."
+            )
+
+        output = work_dir / "Vikky encoding.mkv"
+        job["stage"] = "encoding"
+
+        await send_status(
+            chat_id,
+            "⚙️ Encoding start ayyindi.\n"
+            "🎯 Target file size 3-5 GB range lo prepare chestunnanu.",
+        )
+
+        result = await asyncio.to_thread(
+            encode_to_mkv,
+            source,
+            output,
+            3.0,
+            5.0,
+        )
+
+        job["stage"] = "upload"
+        await send_status(
+            chat_id,
+            "✅ Encoding complete ayyindi.\n"
+            "☁️ Output ni upload hosts ki pampistunnanu.",
+        )
+
+        links = await upload_to_all(output)
+        good_links = {
+            name: link
+            for name, link in links.items()
+            if link and not str(link).startswith("ERROR:")
+        }
+
+        if not good_links:
+            raise RuntimeError("Upload hosts nundi usable link raledu.")
+
+        job["stage"] = "completed"
+        job["links"] = good_links
+        job["size_gb"] = round(result.actual_bytes / 1024**3, 2)
+
+        lines = [
+            "🎉 Movie processing complete ayyindi!",
+            f"📦 Final size: {job['size_gb']} GB",
+            "",
+            "🔗 Download links:",
+        ]
+        for name, link in good_links.items():
+            lines.append(f"{name}: {link}")
+
+        await send_status(chat_id, "\n".join(lines))
+    except (DownloadError, EncodeError) as exc:
+        job["stage"] = "failed"
+        job["error"] = str(exc)
+        await send_status(
+            chat_id,
+            f"❌ Process lo problem vachindi.\n"
+            f"Reason: {exc}",
+        )
+        log.exception("Job %s failed", job_id)
+    except Exception as exc:
+        job["stage"] = "failed"
+        job["error"] = str(exc)
+        await send_status(
+            chat_id,
+            "❌ Processing complete cheyyalekapoyanu.\n"
+            "Konchem sepu tarvata malli link pampandi.",
+        )
+        log.exception("Job %s failed", job_id)
+    finally:
+        heartbeat.cancel()
+        active_jobs.pop(chat_id, None)
         try:
-            now = time.time()
-            while delete_queue and delete_queue[0][2] <= now:
-                chat_id, message_id, _ = delete_queue.popleft()
-                try:
-                    await app.delete_messages(chat_id, message_id)
-                except Exception as exc:
-                    log.debug("Delete failed for %s/%s: %s", chat_id, message_id, exc)
+            import shutil
+            shutil.rmtree(work_dir, ignore_errors=True)
         except Exception:
-            log.exception("Cleanup loop error")
-        await asyncio.sleep(30)
+            pass
 
 
-@app.on_message(filters.private & filters.command(["start", "help"]))
-async def help_handler(_, message: Message) -> None:
-    if message.from_user and message.from_user.id == OWNER_ID:
-        await message.reply_text(
-            "Owner Control Panel\n\n"
-            f"Forward protection: {'ON' if settings['protect_content'] else 'OFF'}\n"
-            f"24h auto-delete: {'ON' if settings['auto_delete_24h'] else 'OFF'}\n\n"
-            "/forward_on\n"
-            "/forward_off\n"
-            "/delete24h_on\n"
-            "/delete24h_off\n"
-            "/to <user_id> <message>\n"
-            "/kaggle\n\n"
-            "Reply to a relayed user message to answer that user."
-        )
-    else:
-        await message.reply_text(
-            "Welcome! Send any message, photo, video, audio or document. "
-            "It will be privately delivered to the admin."
-        )
-
-
-@app.on_message(filters.private & filters.user(OWNER_ID) & filters.command("forward_on"))
-async def forward_on(_, message: Message) -> None:
-    settings["protect_content"] = True
-    await message.reply_text("Forward protection is ON.")
-
-
-@app.on_message(filters.private & filters.user(OWNER_ID) & filters.command("forward_off"))
-async def forward_off(_, message: Message) -> None:
-    settings["protect_content"] = False
-    await message.reply_text("Forward protection is OFF.")
-
-
-@app.on_message(filters.private & filters.user(OWNER_ID) & filters.command("delete24h_on"))
-async def delete_on(_, message: Message) -> None:
-    settings["auto_delete_24h"] = True
-    await message.reply_text("24-hour auto-delete is ON.")
-
-
-@app.on_message(filters.private & filters.user(OWNER_ID) & filters.command("delete24h_off"))
-async def delete_off(_, message: Message) -> None:
-    settings["auto_delete_24h"] = False
-    await message.reply_text("24-hour auto-delete is OFF.")
-
-
-@app.on_message(filters.private & filters.user(OWNER_ID) & filters.command("kaggle"))
-async def kaggle_command(_, message: Message) -> None:
-    await message.reply_text(await kaggle_status())
-
-
-@app.on_message(filters.private & filters.user(OWNER_ID) & filters.command("to"))
-async def send_to_user(_, message: Message) -> None:
-    parts = (message.text or "").split(maxsplit=2)
-    if len(parts) < 3:
-        await message.reply_text("Usage: /to <user_id> <message>")
-        return
-
-    try:
-        target = int(parts[1])
-    except ValueError:
-        await message.reply_text("Invalid Telegram user ID.")
-        return
-
-    sent = await app.send_message(
-        target,
-        parts[2],
-        protect_content=settings["protect_content"],
+@app.on_message(filters.private & filters.command("start"))
+async def start_handler(_, message: Message) -> None:
+    await message.reply_text(
+        "Namaskaram! Ee bot lo movie processing automated ga jarugutundi.\n\n"
+        "Movie link pampiste, message ni automatic ga delete chesi "
+        "background lo download mariyu processing start chestanu.\n\n"
+        "Encoding tarvata output links ikkade pampistanu.\n"
+        "/help - Bot ela use cheyalo telusukondi\n"
+        "/status - Current job details chudandi"
     )
-    schedule_delete(target, sent.id)
-    await message.reply_text(f"Delivered to {target}.")
 
 
-@app.on_message(filters.private & filters.user(OWNER_ID) & ~filters.service)
-async def owner_message(_, message: Message) -> None:
-    if message.text and message.text.startswith("/"):
+@app.on_message(filters.private & filters.command("help"))
+async def help_handler(_, message: Message) -> None:
+    await message.reply_text(
+        "📖 Bot ni use cheyadam chala simple.\n\n"
+        "1. Mee movie direct download link ni pampandi.\n"
+        "2. Link message ni bot automatic ga delete chestundi.\n"
+        "3. Background lo movie download start avuthundi.\n"
+        "4. Download complete ayyaka encoding automatic ga start avuthundi.\n"
+        "5. Process madhyalo live status messages vastayi.\n"
+        "6. Complete ayyaka available download links ikkade vastayi.\n\n"
+        "⚙️ Default processing: movie encoding.\n"
+        "📦 Encoding target: 3-5 GB range.\n\n"
+        "/start - Bot ni start cheyadaniki\n"
+        "/help - Ee guide kosam\n"
+        "/status - Current job details kosam\n\n"
+        "Link pampinappudu bot ni wait cheyyakunda background lo "
+        "process continue chestundi."
+    )
+
+
+@app.on_message(filters.private & filters.command("status"))
+async def status_handler(_, message: Message) -> None:
+    job = active_jobs.get(message.chat.id)
+    if not job:
+        await message.reply_text(
+            "Ippudu mee kosam active job emi ledu.\n"
+            "Movie link pampiste automatic ga process start avuthundi."
+        )
         return
 
-    if message.reply_to_message:
-        target = message_route.get(message.reply_to_message.id)
-        if target:
-            sent = await message.copy(
-                target,
-                protect_content=settings["protect_content"],
-            )
-            schedule_delete(target, sent.id)
-            schedule_delete(OWNER_ID, message.id)
-            return
+    stage = str(job.get("stage", "unknown"))
+    if stage == "download":
+        detail = "Movie download avuthondi."
+    elif stage == "processing":
+        detail = "Movie processing avuthondi."
+    elif stage == "encoding":
+        detail = "Movie encoding avuthondi."
+    elif stage == "upload":
+        detail = "Output upload avuthondi."
+    else:
+        detail = "Job background lo run avuthondi."
 
-        text = (message.text or "").strip()
-        if text.isdigit() and len(text) >= 6:
-            target = int(text)
-            sent = await app.copy_message(
-                target,
-                OWNER_ID,
-                message.reply_to_message.id,
-                protect_content=settings["protect_content"],
-            )
-            schedule_delete(target, sent.id)
-            schedule_delete(OWNER_ID, message.reply_to_message.id)
-            await message.reply_text(f"Sent to {target}.")
-            return
+    await message.reply_text(
+        f"📊 Current job status\n\n"
+        f"🆔 Job: {job['id']}\n"
+        f"⚙️ Stage: {stage}\n"
+        f"ℹ️ {detail}\n\n"
+        "Process complete ayyaka final links automatic ga vastayi."
+    )
 
 
-@app.on_message(filters.private & ~filters.user(OWNER_ID))
-async def relay_to_owner(_, message: Message) -> None:
-    user = message.from_user
-    if not user:
+@app.on_message(filters.private & filters.text & ~filters.command(["start", "help", "status"]))
+async def link_handler(_, message: Message) -> None:
+    url = find_url(message.text or "")
+    if not url:
+        await message.reply_text(
+            "Movie direct download link pampandi.\n"
+            "/help - Ela use cheyalo chudandi."
+        )
         return
 
-    if message.text and message.text.startswith("/"):
+    if message.chat.id in active_jobs:
+        await message.reply_text(
+            "Mee previous movie ippatiki process avuthondi.\n"
+            "/status - Current progress chudandi."
+        )
         return
 
-    full_name = " ".join(
-        x for x in [user.first_name, user.last_name] if x
-    ).strip() or "Unknown"
-    username = f"@{user.username}" if user.username else "No username"
+    job_id = os.urandom(6).hex()
+    active_jobs[message.chat.id] = {
+        "id": job_id,
+        "stage": "queued",
+        "url": url,
+    }
 
     try:
-        relayed = await message.copy(
-            OWNER_ID,
-            protect_content=settings["protect_content"],
-        )
-        message_route[relayed.id] = user.id
-
-        info = await app.send_message(
-            OWNER_ID,
-            f"From: {full_name} | User ID: {user.id} | {username}\n"
-            "Reply to this message or the copied message to answer.",
-            reply_to_message_id=relayed.id,
-        )
-        message_route[info.id] = user.id
-
-        schedule_delete(OWNER_ID, relayed.id)
-        schedule_delete(OWNER_ID, info.id)
-        schedule_delete(message.chat.id, message.id)
+        await message.delete()
     except Exception:
-        log.exception("Failed to relay message %s from %s", message.id, user.id)
-        await message.reply_text("Message delivery failed. Please try again.")
+        log.debug("Incoming link message delete cheyyalekapoyanu.", exc_info=True)
+
+    await send_status(
+        message.chat.id,
+        "🚀 Link receive ayyindi.\n"
+        "🗑️ Link message delete chesanu.\n"
+        "⚡ Background processing start chestunnanu.",
+    )
+
+    asyncio.create_task(process_link(message.chat.id, url, job_id))
 
 
 async def main() -> None:
-    log.info("Starting Pyrogram polling bot...")
+    log.info("Pyrogram polling bot start chestunnanu...")
     await app.start()
     me = await app.get_me()
     log.info("Bot started: @%s (%s)", me.username, me.id)
-    asyncio.create_task(cleanup_loop())
     await asyncio.Event().wait()
 
 
