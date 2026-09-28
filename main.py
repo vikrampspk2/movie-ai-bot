@@ -1,25 +1,15 @@
-"""Render entry point for the real Telegram polling worker."""
+"""Render entry point for the Telegram polling worker and Web Service health port."""
 
 import asyncio
 import logging
 import os
 import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from bot_runner import main as run_bot
 
 log = logging.getLogger("vikky-main")
 
-if __name__ == "__main__":
-    health_server = start_render_health_server()
-    try:
-        asyncio.run(run_bot())
-    except KeyboardInterrupt:
-        log.info("Bot shutdown signal vachindi.")
-    except Exception:
-        log.exception("Bot startup/runtime lo ibbandi vachindi.")
-        raise
-
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 class _HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -33,10 +23,29 @@ class _HealthHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         return
 
+
 def start_render_health_server():
     port = int(os.environ.get("PORT", "8080"))
     server = ThreadingHTTPServer(("0.0.0.0", port), _HealthHandler)
-    thread = threading.Thread(target=server.serve_forever, name="render-health", daemon=True)
+    thread = threading.Thread(
+        target=server.serve_forever,
+        name="render-health",
+        daemon=True,
+    )
     thread.start()
-    logging.getLogger("vikky-main").info("Render health server listening on port %s", port)
+    log.info("Render health server listening on port %s", port)
     return server
+
+
+if __name__ == "__main__":
+    health_server = start_render_health_server()
+    try:
+        asyncio.run(run_bot())
+    except KeyboardInterrupt:
+        log.info("Bot shutdown signal vachindi.")
+    except Exception:
+        log.exception("Bot startup/runtime lo ibbandi vachindi.")
+        raise
+    finally:
+        health_server.shutdown()
+        health_server.server_close()
