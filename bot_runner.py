@@ -102,15 +102,7 @@ async def message_logger(client, message):
 
 @app.on_message(filters.command("start"))
 async def start_cmd(client, message):
-    user_name = message.from_user.first_name if message.from_user else "User"
-    welcome_text = (
-        f"Namaskaram {user_name}! 🙏
-
-"
-        "Nenu mee video encoding mariyu 4K upscaling bot ni.
-"
-        "Direct ga video link pampandi leda kindha unna options select chesukondi."
-    )
+    welcome_text = "Namaskaram! Bot active ga undi.\n\nFast Encode / 4K Upscale ready."
     await message.reply_text(welcome_text, reply_markup=MAIN_BUTTONS)
 
 @app.on_message(filters.command("help"))
