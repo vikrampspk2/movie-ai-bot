@@ -26,10 +26,12 @@ jobs:
 
       - name: Install Dependencies
         run: |
-          pip install httpx
+          pip install -r requirements.txt
 
       - name: Run Bot
         env:
-          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          PYROGRAM_API_ID: ${{ secrets.PYROGRAM_API_ID }}
+          PYROGRAM_API_HASH: ${{ secrets.PYROGRAM_API_HASH }}
         run: |
           python bot_runner.py
