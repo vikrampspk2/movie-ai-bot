@@ -13,7 +13,7 @@ from time import monotonic
 from typing import Awaitable, Callable
 
 from pyrogram import Client, filters
-from pyrogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from pyrogram.types import BotCommand, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from app.encode import EncodeError, encode_to_mkv
 from app.media.downloader import DownloadError, download_url
@@ -493,9 +493,31 @@ async def link_handler(_, message: Message) -> None:
 async def main() -> None:
     log.info("Pyrogram polling bot start chestunnanu...")
     await app.start()
-    me = await app.get_me()
-    log.info("Bot started: @%s (%s)", me.username, me.id)
-    await asyncio.Event().wait()
+    try:
+        # Replace Telegram's default command list so stale menu commands are removed.
+        await app.delete_bot_commands()
+        await app.set_bot_commands(
+            [
+                BotCommand("start", "Bot start cheyyadaniki"),
+                BotCommand("help", "Bot usage guide"),
+                BotCommand("status", "Current job status"),
+            ]
+        )
+        me = await app.get_me()
+        log.info("Bot started successfully: @%s (%s)", me.username, me.id)
+        log.info("Telegram command menu refreshed: /start /help /status")
+        await asyncio.Event().wait()
+    except asyncio.CancelledError:
+        log.info("Bot main task cancelled.")
+        raise
+    except Exception:
+        log.exception("Bot runtime error.")
+        raise
+    finally:
+        try:
+            await app.stop()
+        except Exception:
+            log.exception("Bot shutdown error.")
 
 
 if __name__ == "__main__":
