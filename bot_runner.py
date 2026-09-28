@@ -20,6 +20,7 @@ from pyrogram.types import (
     Message,
 )
 
+from app.config import settings
 from app.encode import EncodeError, encode_to_mkv
 from app.media.downloader import DownloadError, download_url
 from app.uploaders import upload_to_all
@@ -31,21 +32,60 @@ logging.basicConfig(
 )
 log = logging.getLogger("vikky-bot")
 
-API_ID = int(os.getenv("PYROGRAM_API_ID") or os.getenv("API_ID") or "0")
-API_HASH = os.getenv("PYROGRAM_API_HASH") or os.getenv("API_HASH") or ""
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN") or ""
+def _env(*names: str) -> str:
+    for name in names:
+        value = os.getenv(name)
+        if value and value.strip():
+            return value.strip()
+    return ""
 
-if not API_ID or not API_HASH or not BOT_TOKEN:
-    raise RuntimeError(
-        "Telegram credentials levu. PYROGRAM_API_ID, PYROGRAM_API_HASH mariyu "
-        "TELEGRAM_BOT_TOKEN set cheyyali."
+def _api_id() -> int:
+    candidates = [
+        getattr(settings, "telegram_api_id", None),
+        _env("PYROGRAM_API_ID", "API_ID", "TELEGRAM_API_ID", "BOT_API_ID"),
+    ]
+    for value in candidates:
+        if value in (None, ""):
+            continue
+        try:
+            parsed = int(str(value).strip())
+            if parsed > 0:
+                return parsed
+        except (TypeError, ValueError):
+            log.warning("Telegram API ID value ni number ga marchalekapoyanu.")
+    return 0
+
+# app/config.py .env ni load chestundi; environment aliases kuda ikkada support chestunnam.
+API_ID = _api_id()
+API_HASH = (
+    getattr(settings, "telegram_api_hash", "")
+    or _env("PYROGRAM_API_HASH", "API_HASH", "TELEGRAM_API_HASH", "BOT_API_HASH")
+)
+BOT_TOKEN = (
+    getattr(settings, "telegram_bot_token", "")
+    or _env("TELEGRAM_BOT_TOKEN", "BOT_TOKEN", "TELEGRAM_TOKEN", "TG_BOT_TOKEN")
+)
+
+_missing_credentials = []
+if not API_ID:
+    _missing_credentials.append("API_ID")
+if not API_HASH:
+    _missing_credentials.append("API_HASH")
+if not BOT_TOKEN:
+    _missing_credentials.append("BOT_TOKEN")
+
+if _missing_credentials:
+    log.error(
+        "Telegram credentials missing: %s. .env/Render environment lo values set cheyyali. "
+        "Process immediate ga crash cheyyakunda retry mode lo untundi.",
+        ", ".join(_missing_credentials),
     )
 
 app = Client(
     "vikky_bot",
-    api_id=API_ID,
-    api_hash=API_HASH,
-    bot_token=BOT_TOKEN,
+    api_id=API_ID or 1,
+    api_hash=API_HASH or "missing-api-hash",
+    bot_token=BOT_TOKEN or "missing-bot-token",
     in_memory=True,
 )
 
@@ -661,23 +701,33 @@ async def refresh_bot_commands() -> None:
 
 async def main() -> None:
     log.info("Pyrogram polling bot prarambhistunnanu...")
-    await app.start()
-    try:
-        await refresh_bot_commands()
-        me = await app.get_me()
-        log.info("Bot prarambham ayyindi: @%s (%s)", me.username, me.id)
-        await asyncio.Event().wait()
-    except asyncio.CancelledError:
-        log.info("Bot pani aapabadindi.")
-        raise
-    except Exception:
-        log.exception("Bot nadavadam lo pedda ibbandi.")
-        raise
-    finally:
+    while True:
         try:
-            await app.stop()
+            if not API_ID or not API_HASH or not BOT_TOKEN:
+                log.error(
+                    "Telegram credentials complete kaavu. "
+                    "Render/.env values check chestunnanu; 30 seconds tarvata malli prayatnistanu."
+                )
+                await asyncio.sleep(30)
+                continue
+
+            await app.start()
+            await refresh_bot_commands()
+            me = await app.get_me()
+            log.info("Bot prarambham ayyindi: @%s (%s)", me.username, me.id)
+            await asyncio.Event().wait()
+
+        except asyncio.CancelledError:
+            log.info("Bot pani aapabadindi.")
+            raise
         except Exception:
-            log.exception("Bot aapetappudu ibbandi.")
+            log.exception("Bot nadavadam lo ibbandi. 30 seconds tarvata retry chestanu.")
+            try:
+                if app.is_connected:
+                    await app.stop()
+            except Exception:
+                log.exception("Bot aapetappudu ibbandi.")
+            await asyncio.sleep(30)
             
 
 if __name__ == "__main__":
