@@ -32,62 +32,68 @@ logging.basicConfig(
 )
 log = logging.getLogger("vikky-bot")
 
-def _env(*names: str) -> str:
+ENV_ALIASES = {
+    "api_id": ("PYROGRAM_API_ID", "API_ID", "TELEGRAM_API_ID", "BOT_API_ID"),
+    "api_hash": ("PYROGRAM_API_HASH", "API_HASH", "TELEGRAM_API_HASH", "BOT_API_HASH"),
+    "bot_token": ("TELEGRAM_BOT_TOKEN", "BOT_TOKEN", "TELEGRAM_TOKEN", "TG_BOT_TOKEN"),
+}
+DOTENV_FILES = (Path.cwd() / ".env", Path.cwd() / ".env.production", Path(__file__).resolve().parent / ".env", Path(__file__).resolve().parent.parent / ".env")
+
+def _clean(value: object) -> str:
+    return str(value).strip().strip(chr(34)).strip(chr(39)) if value is not None else ""
+
+def _read_dotenv_files() -> dict[str, str]:
+    values: dict[str, str] = {}
+    wanted = {name for names in ENV_ALIASES.values() for name in names}
+    for path in DOTENV_FILES:
+        try:
+            if not path.is_file():
+                continue
+            for raw_line in path.read_text(encoding="utf-8").splitlines():
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                if key in wanted:
+                    values.setdefault(key, _clean(value.split(" #", 1)[0].strip()))
+        except (OSError, UnicodeError):
+            log.debug("Env file read cheyyalekapoyanu: %s", path, exc_info=True)
+    return values
+
+def _first_value(names: tuple[str, ...], dotenv_values: dict[str, str]) -> str:
     for name in names:
-        value = os.getenv(name)
-        if value and value.strip():
-            return value.strip()
+        value = _clean(os.environ.get(name, ""))
+        if value:
+            return value
+    for name in names:
+        value = _clean(dotenv_values.get(name, ""))
+        if value:
+            return value
     return ""
 
-def _api_id() -> int:
-    candidates = [
-        getattr(settings, "telegram_api_id", None),
-        _env("PYROGRAM_API_ID", "API_ID", "TELEGRAM_API_ID", "BOT_API_ID"),
-    ]
-    for value in candidates:
-        if value in (None, ""):
-            continue
-        try:
-            parsed = int(str(value).strip())
-            if parsed > 0:
-                return parsed
-        except (TypeError, ValueError):
-            log.warning("Telegram API ID value ni number ga marchalekapoyanu.")
-    return 0
+def _resolve_credentials() -> tuple[int, str, str, tuple[str, ...]]:
+    dotenv_values = _read_dotenv_files()
+    configured_api_id = _clean(getattr(settings, "telegram_api_id", ""))
+    configured_api_hash = _clean(getattr(settings, "telegram_api_hash", ""))
+    configured_bot_token = _clean(getattr(settings, "telegram_bot_token", ""))
+    api_id_raw = configured_api_id or _first_value(ENV_ALIASES["api_id"], dotenv_values)
+    api_hash = configured_api_hash or _first_value(ENV_ALIASES["api_hash"], dotenv_values)
+    bot_token = configured_bot_token or _first_value(ENV_ALIASES["bot_token"], dotenv_values)
+    try:
+        api_id = int(api_id_raw) if api_id_raw else 0
+        if api_id < 1:
+            api_id = 0
+    except (TypeError, ValueError):
+        api_id = 0
+    missing = []
+    if not api_id: missing.append("API_ID")
+    if not api_hash: missing.append("API_HASH")
+    if not bot_token: missing.append("BOT_TOKEN")
+    return api_id, api_hash, bot_token, tuple(missing)
 
-# app/config.py .env ni load chestundi; environment aliases kuda ikkada support chestunnam.
-API_ID = _api_id()
-API_HASH = (
-    getattr(settings, "telegram_api_hash", "")
-    or _env("PYROGRAM_API_HASH", "API_HASH", "TELEGRAM_API_HASH", "BOT_API_HASH")
-)
-BOT_TOKEN = (
-    getattr(settings, "telegram_bot_token", "")
-    or _env("TELEGRAM_BOT_TOKEN", "BOT_TOKEN", "TELEGRAM_TOKEN", "TG_BOT_TOKEN")
-)
-
-_missing_credentials = []
-if not API_ID:
-    _missing_credentials.append("API_ID")
-if not API_HASH:
-    _missing_credentials.append("API_HASH")
-if not BOT_TOKEN:
-    _missing_credentials.append("BOT_TOKEN")
-
-if _missing_credentials:
-    log.error(
-        "Telegram credentials missing: %s. .env/Render environment lo values set cheyyali. "
-        "Process immediate ga crash cheyyakunda retry mode lo untundi.",
-        ", ".join(_missing_credentials),
-    )
-
-app = Client(
-    "vikky_bot",
-    api_id=API_ID or 1,
-    api_hash=API_HASH or "missing-api-hash",
-    bot_token=BOT_TOKEN or "missing-bot-token",
-    in_memory=True,
-)
+API_ID, API_HASH, BOT_TOKEN, _MISSING_CREDENTIALS = _resolve_credentials()
+app = Client("vikky_bot", api_id=API_ID or 1, api_hash=API_HASH or "waiting-for-credentials", bot_token=BOT_TOKEN or "waiting-for-credentials", in_memory=True)
 
 URL_RE = re.compile(r"https?://[^\s<>\"]+")
 
@@ -700,35 +706,39 @@ async def refresh_bot_commands() -> None:
 
 
 async def main() -> None:
+    global API_ID, API_HASH, BOT_TOKEN, app
     log.info("Pyrogram polling bot prarambhistunnanu...")
+    last_missing: tuple[str, ...] | None = None
+    reported_missing_at = 0.0
+    retry_delay = 30
     while True:
         try:
-            if not API_ID or not API_HASH or not BOT_TOKEN:
-                log.error(
-                    "Telegram credentials complete kaavu. "
-                    "Render/.env values check chestunnanu; 30 seconds tarvata malli prayatnistanu."
-                )
-                await asyncio.sleep(30)
+            API_ID, API_HASH, BOT_TOKEN, missing = _resolve_credentials()
+            if missing:
+                now = monotonic()
+                if missing != last_missing or now - reported_missing_at >= 600:
+                    log.warning("Telegram credentials inka dorakaledu: %s. Render/.env values check cheyyandi.", ", ".join(missing))
+                    last_missing = missing
+                    reported_missing_at = now
+                await asyncio.sleep(retry_delay)
                 continue
-
+            app = Client("vikky_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, in_memory=True)
             await app.start()
             await refresh_bot_commands()
             me = await app.get_me()
             log.info("Bot prarambham ayyindi: @%s (%s)", me.username, me.id)
             await asyncio.Event().wait()
-
         except asyncio.CancelledError:
             log.info("Bot pani aapabadindi.")
             raise
         except Exception:
-            log.exception("Bot nadavadam lo ibbandi. 30 seconds tarvata retry chestanu.")
+            log.exception("Bot runtime lo ibbandi vachindi; clean restart chestanu.")
             try:
                 if app.is_connected:
                     await app.stop()
             except Exception:
-                log.exception("Bot aapetappudu ibbandi.")
-            await asyncio.sleep(30)
-            
+                log.debug("Bot stop cleanup lo ibbandi.", exc_info=True)
+            await asyncio.sleep(retry_delay)
 
 if __name__ == "__main__":
     try:
