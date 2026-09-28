@@ -102,63 +102,28 @@ async def message_logger(client, message):
 
 @app.on_message(filters.command("start"))
 async def start_cmd(client, message):
-    welcome_text = "Namaskaram! Bot active ga undi.\n\nFast Encode / 4K Upscale ready."
+    welcome_text = "Namaskaram! Bot active ga undi. Fast Encode / 4K Upscale ready."
     await message.reply_text(welcome_text, reply_markup=MAIN_BUTTONS)
 
 @app.on_message(filters.command("help"))
 async def help_cmd(client, message):
-    help_text = (
-        "🤖 **Bot Usage Guide**
-
-"
-        "• `/start` - Bot ni start cheyadaniki
-"
-        "• `/help` - Help mariyu commands list
-"
-        "• `/status` - Current server mariyu queue status
-"
-        "• `/encode` - Fast video encoding
-"
-        "• `/upscale` - 4K AI video upscaling
-
-"
-        "Direct video file leda download link pampinchi processing prarambhinchandi."
-    )
+    help_text = "Bot Usage Guide: /start, /help, /status, /encode, /upscale. Send video link to process."
     await message.reply_text(help_text, reply_markup=MAIN_BUTTONS)
 
 @app.on_message(filters.command("status"))
 async def status_cmd(client, message):
-    await message.reply_text(
-        "📊 **Current Status**
-
-"
-        "✅ Bot: Active & Online
-"
-        "⚡ Queue: Ready to process new tasks
-"
-        "🚀 Engine: Ready",
-        reply_markup=MAIN_BUTTONS,
-    )
+    status_text = "Status: Bot is Active & Online. Queue ready."
+    await message.reply_text(status_text, reply_markup=MAIN_BUTTONS)
 
 @app.on_message(filters.command("encode"))
 async def encode_cmd(client, message):
-    await message.reply_text(
-        "📦 **Fast Video Encode Ready**
-
-"
-        "Video file leda direct download link ikkada pampandi.",
-        reply_markup=MAIN_BUTTONS,
-    )
+    encode_text = "Fast Video Encode Ready. Send video file or link."
+    await message.reply_text(encode_text, reply_markup=MAIN_BUTTONS)
 
 @app.on_message(filters.command("upscale"))
 async def upscale_cmd(client, message):
-    await message.reply_text(
-        "🎬 **4K AI Upscale Ready**
-
-"
-        "Upscale cheyalsina video file leda link pampandi.",
-        reply_markup=MAIN_BUTTONS,
-    )
+    upscale_text = "4K AI Upscale Ready. Send video file or link."
+    await message.reply_text(upscale_text, reply_markup=MAIN_BUTTONS)
 
 # ============================================================
 # CALLBACK QUERY HANDLER
