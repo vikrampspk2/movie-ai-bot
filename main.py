@@ -26,9 +26,10 @@ BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
 
 app = Client("my_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, in_memory=True)
 
-@app.on_message(filters.command("start"))
+@app.on_message(filters.command(["start", "help"]) | filters.regex(r"^/start"))
 async def start_handler(client, message):
-    await message.reply_text("Namaskaram! Bot active ga undi.")
+    print(f"Triggered start from {message.from_user.id}", flush=True)
+    await message.reply_text("Namaskaram! Bot active ga undi. Mee video link pampandi.")
 
 async def main():
     await app.start()
