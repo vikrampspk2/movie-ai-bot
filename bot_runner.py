@@ -150,7 +150,7 @@ async def acquire_slot(job: Job) -> str:
     # Required policy: GPU work can coexist with one CPU encode, but once
     # a CPU task is running, new tasks wait in the queue.
     if job.kind == "upscale":
-        while GPU_RUNNING:
+        while GPU_RUNNING or CPU_RUNNING:
             await asyncio.sleep(0.5)
         GPU_RUNNING = True
         return "gpu"
@@ -272,7 +272,7 @@ async def scheduler() -> None:
         # GPU upscale and CPU encode may run together. A CPU task never
         # starts while another CPU task is active.
         if next_job.kind == "upscale":
-            if GPU_RUNNING:
+            if GPU_RUNNING or CPU_RUNNING:
                 return
         else:
             if CPU_RUNNING:
