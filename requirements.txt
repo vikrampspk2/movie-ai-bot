@@ -4,3 +4,4 @@ httpx
 pyrogram==2.0.106
 tgcrypto
 kaggle
+pydantic-settings
