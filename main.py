@@ -1,51 +1,40 @@
-"""Render entry point for the Telegram polling worker and Web Service health port."""
-
 import asyncio
-import logging
 import os
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pyrogram import Client, filters
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-from bot_runner import main as run_bot
-
-log = logging.getLogger("vikky-main")
-
-
-class _HealthHandler(BaseHTTPRequestHandler):
+# Health server to keep Render Live
+class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        body = b"OK"
         self.send_response(200)
-        self.send_header("Content-Type", "text/plain")
-        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        self.wfile.write(b"OK")
 
-    def log_message(self, format, *args):
-        return
+def run_health():
+    port = int(os.getenv("PORT", "10000"))
+    server = ThreadingHTTPServer(("0.0.0.0", port), HealthHandler)
+    server.serve_forever()
 
+threading.Thread(target=run_health, daemon=True).start()
 
-def start_render_health_server():
-    port = int(os.environ.get("PORT", "8080"))
-    server = ThreadingHTTPServer(("0.0.0.0", port), _HealthHandler)
-    thread = threading.Thread(
-        target=server.serve_forever,
-        name="render-health",
-        daemon=True,
-    )
-    thread.start()
-    log.info("Render health server listening on port %s", port)
-    return server
+# Pyrogram Setup
+API_ID = int(os.getenv("API_ID") or os.getenv("TELEGRAM_API_ID") or 0)
+API_HASH = os.getenv("API_HASH") or os.getenv("TELEGRAM_API_HASH")
+BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
 
+app = Client("my_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, in_memory=True)
+
+@app.on_message(filters.command("start"))
+async def start_handler(client, message):
+    await message.reply_text("Namaskaram! Bot active ga undi.")
+
+async def main():
+    await app.start()
+    await app.delete_webhook(drop_pending_updates=True)
+    print("PYROGRAM LIVE", flush=True)
+    await asyncio.Event().wait()
 
 if __name__ == "__main__":
-    health_server = start_render_health_server()
-    try:
-        asyncio.run(run_bot())
-    except KeyboardInterrupt:
-        log.info("Bot shutdown signal vachindi.")
-    except Exception:
-        log.exception("Bot startup/runtime lo ibbandi vachindi.")
-        raise
-    finally:
-        health_server.shutdown()
-        health_server.server_close()
+    asyncio.run(main())
