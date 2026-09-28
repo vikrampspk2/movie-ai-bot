@@ -1,9 +1,8 @@
 import os
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pyrogram import Client, filters
+from pyrogram import Client
 
-# 1. Render Health Port Listener
 class HealthServer(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -17,7 +16,6 @@ def start_server():
 
 threading.Thread(target=start_server, daemon=True).start()
 
-# 2. Telegram Bot
 API_ID = int(os.getenv("API_ID") or os.getenv("TELEGRAM_API_ID") or 0)
 API_HASH = os.getenv("API_HASH") or os.getenv("TELEGRAM_API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
