@@ -1,8 +1,6 @@
 import asyncio
 import logging
 import os
-import threading
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from pyrogram import Client, filters
 from pyrogram.types import (
@@ -42,27 +40,6 @@ BOT_TOKEN = (
     or os.getenv("TELEGRAM_TOKEN")
     or os.getenv("TG_BOT_TOKEN")
 )
-
-# ============================================================
-# RENDER DUMMY HTTP SERVER (PORT 10000)
-# ============================================================
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain")
-        self.end_headers()
-        self.wfile.write(b"Bot is alive")
-
-    def log_message(self, format, *args):
-        return
-
-def start_health_server():
-    port = int(os.getenv("PORT", "10000"))
-    server = ThreadingHTTPServer(("0.0.0.0", port), HealthHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    log.info(f"Render health server listening on port {port}")
-    return server
 
 # ============================================================
 # PYROGRAM CLIENT
@@ -134,31 +111,28 @@ async def callbacks(client, callback_query):
     await callback_query.answer()
 
     if data == "btn_encode":
-        await callback_query.message.reply_text("📦 Fast Encode kosam video file leda link pampandi.")
+        await callback_query.message.reply_text("Fast Encode kosam video file leda link pampandi.")
     elif data == "btn_upscale":
-        await callback_query.message.reply_text("🎬 4K Upscale kosam video file leda link pampandi.")
+        await callback_query.message.reply_text("4K Upscale kosam video file leda link pampandi.")
     elif data == "btn_status":
-        await callback_query.message.reply_text("📊 Bot server active ga undi. Tasks kosam ready!")
+        await callback_query.message.reply_text("Bot server active ga undi. Tasks kosam ready!")
     elif data == "btn_help":
-        await callback_query.message.reply_text("📖 Video link pampagane processing options kanipisthayi.")
+        await callback_query.message.reply_text("Video link pampagane processing options kanipisthayi.")
 
 # ============================================================
 # MAIN ENTRYPOINT
 # ============================================================
 async def main():
-    health_server = start_health_server()
     try:
         log.info("Starting Pyrogram client...")
         await app.start()
 
-        # Webhook clear chesi polling ki updates vachelaga chustundi
         try:
             await app.delete_webhook(drop_pending_updates=True)
             log.info("Telegram webhook clear ayyindi.")
         except Exception as e:
-            log.warning(f"Webhook delete chesetappudu error: {e}")
+            log.warning(f"Webhook delete error: {e}")
 
-        # Telegram menu commands force update
         try:
             commands = [
                 BotCommand("start", "Bot ni start cheyandi"),
@@ -168,12 +142,12 @@ async def main():
                 BotCommand("upscale", "4K video upscaling"),
             ]
             await app.set_bot_commands(commands, scope=BotCommandScopeDefault())
-            log.info("Telegram default command menu force update ayyindi.")
+            log.info("Telegram command menu set ayyindi.")
         except Exception as e:
-            log.warning(f"Commands set chesetappudu error: {e}")
+            log.warning(f"Commands set error: {e}")
 
         me = await app.get_me()
-        log.info(f"Bot prarambham ayyindi: @{me.username} ({me.id})")
+        log.info(f"Bot live: @{me.username} ({me.id})")
         print("PYROGRAM POLLING IS LIVE", flush=True)
 
         await asyncio.Event().wait()
@@ -181,10 +155,6 @@ async def main():
         log.info("Stopping bot...")
         try:
             await app.stop()
-        except Exception:
-            pass
-        try:
-            health_server.shutdown()
         except Exception:
             pass
 
