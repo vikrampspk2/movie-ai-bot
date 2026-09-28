@@ -146,25 +146,20 @@ async def heartbeat(job: Job) -> None:
 
 async def acquire_slot(job: Job) -> str:
     global GPU_RUNNING, CPU_RUNNING
-    # Upscale is GPU-only. Encode is CPU/GPU-capable but is deliberately
-    # classified as CPU here so two encodes do not overload one worker.
+    # Upscale uses the GPU. Encode uses the CPU slot.
+    # Required policy: GPU work can coexist with one CPU encode, but once
+    # a CPU task is running, new tasks wait in the queue.
     if job.kind == "upscale":
         while GPU_RUNNING:
             await asyncio.sleep(0.5)
         GPU_RUNNING = True
         return "gpu"
 
-    if not CPU_RUNNING:
-        CPU_RUNNING = True
-        return "cpu"
-
-    # If CPU is occupied, allow one GPU-capable encode only when GPU is idle.
-    if not GPU_RUNNING:
-        GPU_RUNNING = True
-        return "gpu"
-
-    while CPU_RUNNING or GPU_RUNNING:
+    while CPU_RUNNING or (GPU_RUNNING and job.kind != "encode"):
         await asyncio.sleep(0.5)
+    if CPU_RUNNING:
+        while CPU_RUNNING:
+            await asyncio.sleep(0.5)
     CPU_RUNNING = True
     return "cpu"
 
@@ -274,12 +269,13 @@ async def scheduler() -> None:
             await cleanup_job(next_job)
             continue
 
-        # Upscale needs the GPU slot. Encode can use CPU, or GPU when CPU is busy.
+        # GPU upscale and CPU encode may run together. A CPU task never
+        # starts while another CPU task is active.
         if next_job.kind == "upscale":
             if GPU_RUNNING:
                 return
         else:
-            if CPU_RUNNING and GPU_RUNNING:
+            if CPU_RUNNING:
                 return
 
         job_queue.popleft()
