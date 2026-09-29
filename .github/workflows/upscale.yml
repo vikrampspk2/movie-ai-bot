@@ -39,10 +39,18 @@ jobs:
       - name: Download and content identity
         run: |
           set -euo pipefail
-          yt-dlp --no-part --external-downloader aria2c --external-downloader-args "-x 16 -s 16 -k 1M" "$VIDEO_URL" -o input.mp4 || true
+          test -n "$VIDEO_URL" || { echo "ERROR: VIDEO_URL is empty. For manual runs provide video_url; for bot runs provide client_payload.url."; exit 1; }
+          echo "Input URL received. Downloading video..."
+          rm -f input.mp4
+          if ! yt-dlp --no-part --external-downloader aria2c --external-downloader-args "-x 16 -s 16 -k 1M" "$VIDEO_URL" -o input.mp4; then
+            rm -f input.mp4
+          fi
           [ -s input.mp4 ] || aria2c -x 16 -s 16 -k 1M "$VIDEO_URL" -o input.mp4 || true
-          [ -s input.mp4 ] || curl -fL --retry 5 "$VIDEO_URL" -o input.mp4
-          test -s input.mp4
+          if [ ! -s input.mp4 ]; then
+            curl -fL --retry 5 --retry-all-errors "$VIDEO_URL" -o input.mp4
+          fi
+          test -s input.mp4 || { echo "ERROR: video download produced no file."; exit 1; }
+          ffprobe -v error -select_streams v:0 -show_entries stream=index -of csv=p=0 input.mp4 | grep -q . || { echo "ERROR: downloaded file has no video stream."; exit 1; }
           SHA=$(sha256sum input.mp4 | awk '{print $1}')
           FRAMES=$(ffprobe -v error -count_frames -select_streams v:0 -show_entries stream=nb_read_frames -of csv=p=0 input.mp4 | tail -1)
           FPS=$(ffprobe -v error -select_streams v:0 -show_entries stream=avg_frame_rate -of csv=p=0 input.mp4)
@@ -76,15 +84,19 @@ jobs:
           else
             rm -f state/s.normalized.json
           fi
-          if [ "$(jq -r .status state/s.json)" = complete ] && [ "$(jq -r .sha256 state/s.json)" = "$SHA" ]; then
-            GO=$(jq -r .final_links.gofile state/s.json); BZ=$(jq -r .final_links.buzzheavier state/s.json)
-            if curl -fsIL --max-time 20 "$GO" >/dev/null 2>&1 && curl -fsIL --max-time 20 "$BZ" >/dev/null 2>&1; then
-              echo "DONE=true" >> "$GITHUB_ENV"; echo "VIDEO ID: $ID"; echo "GOFILE: $GO"; echo "BUZZHEAVIER: $BZ"
-            else echo "DONE=false" >> "$GITHUB_ENV"; fi
-          else echo "DONE=false" >> "$GITHUB_ENV"; fi
+          # Do not use a DONE flag to gate processing. Every run enters the
+          # real processing/resume path; already checkpointed chunks are skipped
+          # only inside the chunk loop.
+          if [ "$(jq -r .sha256 state/s.json)" != "$SHA" ] || [ "$(jq -r .video_id state/s.json)" != "$ID" ]; then
+            jq --arg id "$ID" --arg sha "$SHA" --arg fps "$FPS" --argjson f "$FRAMES" --argjson w "$W" --argjson h "$H"               '{video_id:$id,sha256:$sha,frame_count:$f,fps:$fps,width:$w,height:$h,status:"new",chunks:{},final_links:{}}' > state/s.json
+          fi
+          STORED=$(jq '.chunks | length' state/s.json 2>/dev/null || echo 0)
+          echo "VIDEO ID: $ID"
+          echo "FRAME COUNT: $FRAMES"
+          echo "STORED CHUNKS: $STORED"
+          echo "PROCESSING PATH: ACTIVE"
 
       - name: Install official Real-ESRGAN CPU FP32
-        if: ${{ env.DONE != 'true' }}
         run: |
           set -euo pipefail
           python3 -m pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cpu
@@ -95,14 +107,12 @@ jobs:
           wget -q -O weights/RealESRGAN_x4plus.pth https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth
 
       - name: Preserve original audio
-        if: ${{ env.DONE != 'true' }}
         run: |
           if ffprobe -v error -select_streams a:0 -show_entries stream=index -of csv=p=0 input.mp4 | grep -q .; then
             ffmpeg -hide_banner -loglevel error -y -i input.mp4 -map 0:a? -c:a copy audio.mka
           else : > audio.mka; fi
 
       - name: Stream Real-ESRGAN without frame accumulation
-        if: ${{ env.DONE != 'true' }}
         run: |
           cat > ai.py <<'PY'
           import sys,os,argparse,subprocess,numpy as np,torch
@@ -128,7 +138,6 @@ jobs:
           PY
 
       - name: Hash-resume missing chunks and checkpoint
-        if: ${{ env.DONE != 'true' }}
         run: |
           set -euo pipefail
           mkdir -p work chunks
@@ -141,7 +150,10 @@ jobs:
           while s<total:
             e=min(total,(i+1)*per);print(i,s,e-s,float(Fraction(s,1)/fps));s=e;i+=1
           PY
-          TOTAL=$(wc -l < work/p); echo "TOTAL=$TOTAL" >> "$GITHUB_ENV"
+          TOTAL=$(wc -l < work/p)
+          [ "$TOTAL" -gt 0 ] || { echo "ERROR: chunk plan is empty."; exit 1; }
+          echo "TOTAL=$TOTAL" >> "$GITHUB_ENV"
+          echo "Chunk plan contains $TOTAL chunks."
           save(){
             jq -e . state/s.json >/dev/null 2>&1 || { echo "WARNING: invalid local state; skipping save." >&2; return 0; }
             b=$(base64 -w0 state/s.json 2>/dev/null) || { echo "WARNING: state encoding failed." >&2; return 0; }
@@ -154,9 +166,15 @@ jobs:
             return 0
           }
           jq '.status="partial"' state/s.json > state/t;mv state/t state/s.json;save
+          PROCESSED=0
+          SKIPPED=0
           while read -r I S N SEC;do
-            if jq -e --arg i "$I" '.chunks[$i].buzz // empty' state/s.json >/dev/null 2>&1;then echo "SKIP $I";continue;fi
-            LEFT=$((DEAD-$(date +%s)-RESERVE));[ "$LEFT" -ge 120 ]||break
+            if jq -e --arg i "$I" '.chunks[$i].buzz // empty' state/s.json >/dev/null 2>&1;then echo "RESUME: chunk $I already checkpointed"; SKIPPED=$((SKIPPED+1)); continue;fi
+            LEFT=$((DEAD-$(date +%s)-RESERVE))
+            if [ "$LEFT" -lt 120 ]; then
+              echo "ERROR: insufficient safe runtime for another chunk."
+              break
+            fi
             rm -f chunks/c.ts
             set +e
             timeout --signal=TERM --kill-after=60s "$LEFT" bash -c 'ffmpeg -hide_banner -loglevel error -ss "'"$SEC"'" -i input.mp4 -frames:v "'"$N"'" -f rawvideo -pix_fmt bgr24 -r "'"$FPS"'" - | python3 ai.py --w "'"$W"'" --h "'"$H"'" --fps "'"$FPS"'" --n "'"$N"'" --out chunks/c.ts'
@@ -178,17 +196,23 @@ jobs:
               rm -f state/t chunks/c.ts
               break
             fi
+            PROCESSED=$((PROCESSED+1))
             rm -f chunks/c.ts
           done < work/p
+          echo "Chunk loop finished: processed=$PROCESSED checkpointed=$SKIPPED"
           rm -f input.mp4
+          FINAL_DONE=$(jq --argjson t "$TOTAL" '[.chunks|keys[]|tonumber] | length == $t' state/s.json 2>/dev/null || echo false)
+          [ "$FINAL_DONE" = "true" ] || {
+            echo "ERROR: not all chunks are checkpointed. State is retained for resume."
+            exit 1
+          }
 
       - name: Merge, outro, untouched audio and dual upload
-        if: ${{ env.DONE != 'true' }}
         run: |
           set -euo pipefail
           DONE_N=$(jq '.chunks|length' state/s.json 2>/dev/null || echo 0)
           TOTAL_N=$TOTAL
-          [ "$DONE_N" -gt 0 ] || { echo "No completed chunks yet; state retained for resume."; exit 0; }
+          [ "$DONE_N" -gt 0 ] || { echo "ERROR: no completed chunks available for merge."; exit 1; }
           mkdir -p merge;:>merge/l
           for I in $(jq -r '.chunks|keys[]' state/s.json|sort -n);do
             P=$(jq -r --arg i "$I" '.chunks[$i].buzz // empty' state/s.json 2>/dev/null || true)
@@ -206,17 +230,25 @@ jobs:
             [ -n "$D" ] || continue
             printf "file '%s'\n" "$D" >> merge/l
           done
-          [ -s merge/l ] || { echo "No downloadable completed chunks; state retained for resume."; exit 0; }
+          [ -s merge/l ] || { echo "ERROR: no downloadable completed chunks were recovered. Refusing fake success."; exit 1; }
           ffmpeg -hide_banner -loglevel warning -y -protocol_whitelist file,http,https,tcp,tls,crypto -f concat -safe 0 -i merge/l -c copy merge/ai.ts
-          SIZE="$W"x"$H"
+          OW=$((W*4)); OH=$((H*4)); SIZE="${OW}x${OH}"
           ffmpeg -hide_banner -loglevel warning -y -f lavfi -i "color=c=black:s=$SIZE:d=3:r=$FPS" -vf "drawtext=text='AI Upscale 4K by Vikky':fontcolor=white:fontsize=80:x=(w-text_w)/2:y=(h-text_h)/2" -c:v libx265 -crf 16 -preset fast -pix_fmt yuv420p -f mpegts merge/o.ts
           printf "file 'ai.ts'\nfile 'o.ts'\n" > merge/v
           ffmpeg -hide_banner -loglevel warning -y -f concat -safe 0 -i merge/v -c copy merge/video.ts
           FINAL="vikky_$ID.mkv"
           if [ -s audio.mka ];then ffmpeg -hide_banner -loglevel warning -y -i merge/video.ts -i audio.mka -map 0:v:0 -map 1:a? -c:v copy -c:a copy "$FINAL";else cp merge/video.ts "$FINAL";fi
-          GO=$(curl -fL --retry 5 -F "file=@$FINAL" https://upload.gofile.io/uploadfile|jq -r '.data.downloadPage//empty')
-          J=$(curl -fL --retry 5 -T "$FINAL" "https://w.buzzheavier.com/$FINAL");BID=$(echo "$J"|jq -r '.data.id//empty');test -n "$GO" -a -n "$BID";BZ="https://buzzheavier.com/$BID"
-          [ "$DONE_N" -eq "$TOTAL_N" ]&&ST=complete||ST=partial
+          GO=$(curl -fL --retry 5 --retry-all-errors -F "file=@$FINAL" https://upload.gofile.io/uploadfile | jq -r '.data.downloadPage // empty')
+          J=$(curl -fL --retry 5 --retry-all-errors -T "$FINAL" "https://w.buzzheavier.com/$FINAL")
+          BID=$(printf '%s' "$J" | jq -r '.data.id // empty')
+          test -n "$GO" || { echo "ERROR: Gofile upload did not return a download page."; exit 1; }
+          test -n "$BID" || { echo "ERROR: Buzzheavier upload did not return an id."; exit 1; }
+          BZ="https://buzzheavier.com/$BID"
+          [ "$DONE_N" -eq "$TOTAL_N" ] || { echo "ERROR: not all chunks are checkpointed."; exit 1; }
+          ST=complete
           save(){ b=$(base64 -w0 state/s.json); old=$(gh api "repos/$GITHUB_REPOSITORY/contents/$STATE?ref=$STATE_BRANCH" --jq .sha 2>/dev/null||true); if [ -n "$old" ];then gh api --method PUT "repos/$GITHUB_REPOSITORY/contents/$STATE" -f message="video-state $ID $ST" -f content="$b" -f branch="$STATE_BRANCH" -f sha="$old" >/dev/null;else gh api --method PUT "repos/$GITHUB_REPOSITORY/contents/$STATE" -f message="video-state $ID $ST" -f content="$b" -f branch="$STATE_BRANCH" >/dev/null;fi; }
-          jq --arg st "$ST" --arg go "$GO" --arg bz "$BZ" --argjson d "$DONE_N" --argjson t "$TOTAL_N" '.status=$st|.final_links={gofile:$go,buzzheavier:$bz}|.completed_chunks=$d|.total_chunks=$t' state/s.json > state/t;mv state/t state/s.json;save
+          jq --arg st "$ST" --arg go "$GO" --arg bz "$BZ" --argjson d "$DONE_N" --argjson t "$TOTAL_N" '.status=$st|.final_links={gofile:$go,buzzheavier:$bz}|.completed_chunks=$d|.total_chunks=$t' state/s.json > state/t
+          jq -e '.status=="complete" and .final_links.gofile!="" and .final_links.buzzheavier!=""' state/t >/dev/null || { echo "ERROR: final state validation failed."; exit 1; }
+          mv state/t state/s.json
+          save
           echo "VIDEO ID: $ID";echo "SHA-256: $SHA";echo "FRAMES: $FRAMES";echo "CHUNKS: $DONE_N/$TOTAL_N";echo "STATUS: $ST";echo "GOFILE: $GO";echo "BUZZHEAVIER: $BZ"
