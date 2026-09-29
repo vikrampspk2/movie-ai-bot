@@ -9,28 +9,27 @@ TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN")
 GH_PAT_TOKEN = os.environ.get("GH_PAT_TOKEN")
 GH_REPO = os.environ.get("GH_REPO")
 
-# 1. Patha webhook delete chesthunnam (Conflicts clear avvadaniki)
+# Clear old webhooks
 requests.get(f"https://api.telegram.org/bot{TG_BOT_TOKEN}/deleteWebhook?drop_pending_updates=true")
 
-# 2. Render 24/7 online unchadaniki dummy web server
-class KeepAliveHandler(BaseHTTPRequestHandler):
+class StatusHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Vikky 4K Bot Server Active 24/7")
+        self.wfile.write(b"Vikky 4K Controller Online 24/7")
 
-def start_server():
+def keep_alive():
     port = int(os.environ.get("PORT", 8080))
-    server = HTTPServer(("0.0.0.0", port), KeepAliveHandler)
+    server = HTTPServer(("0.0.0.0", port), StatusHandler)
     server.serve_forever()
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Vikky 4K AI Upscaler Bot Online lo undi bro!\nDirect ga video link pampinchina leda /upscale <link> ichina process start avthundi.")
+    await update.message.reply_text("Vikky 4K AI Upscaler Online lo undi bro!\nVideo link send cheyandi leda /upscale <link> ivvandi.")
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Usage:\n1. Direct link, Google Drive link, leda streaming URL pampandi.\n2. Automatic ga zero-loss 4K upscale aipoyi download link vasthundi.")
+    await update.message.reply_text("Usage:\nDirect video URL or Google Drive link send cheyandi.")
 
-async def process_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     if text.startswith("/upscale"):
         parts = text.split(maxsplit=1)
@@ -43,9 +42,8 @@ async def process_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE):
         url = text
 
     chat_id = update.effective_chat.id
-    await update.message.reply_text("Link vachindi bro! Background lo zero-loss 4K upscale start ayyindi. File ready ayyaka direct link pamputhanu...")
+    status_msg = await update.message.reply_text("Request register ayyindi bro. GitHub Actions trigger chesthunna...")
 
-    # GitHub Actions trigger chesthunnam
     headers = {
         "Authorization": f"Bearer {GH_PAT_TOKEN}",
         "Accept": "application/vnd.github.v3+json"
@@ -54,13 +52,26 @@ async def process_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "event_type": "start_upscale",
         "client_payload": {"url": url, "chat_id": chat_id}
     }
-    requests.post(f"https://api.github.com/repos/{GH_REPO}/dispatches", headers=headers, json=payload)
+    res = requests.post(f"https://api.github.com/repos/{GH_REPO}/dispatches", headers=headers, json=payload)
+
+    if res.status_code == 204:
+        await context.bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=status_msg.message_id,
+            text="✅ GitHub Actions start ayyindi bro! Background lo AI upscale avthundi. Prathi 2 mins ki live status update vasthundi."
+        )
+    else:
+        await context.bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=status_msg.message_id,
+            text=f"❌ GitHub trigger fail ayyindi!\nStatus Code: {res.status_code}\nResponse: {res.text}\nCheck: GH_REPO and GH_PAT_TOKEN permissions."
+        )
 
 if __name__ == "__main__":
-    threading.Thread(target=start_server, daemon=True).start()
+    threading.Thread(target=keep_alive, daemon=True).start()
     app = ApplicationBuilder().token(TG_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("upscale", process_trigger))
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), process_trigger))
+    app.add_handler(CommandHandler("upscale", handle_process))
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_process))
     app.run_polling()
