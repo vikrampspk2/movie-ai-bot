@@ -1,4 +1,4 @@
-name: Vikky 4K AI Upscaler to Gofile
+name: Vikky Pure 4K Deep Learning Engine
 
 on:
   workflow_dispatch:
@@ -6,52 +6,84 @@ on:
       video_url:
         description: 'Direct Video URL'
         required: true
-        default: 'https://f2l2.reaperzclub.dpdns.org/xp1gdlr?hash=AgADhC&dl=1'
         type: string
+        default: 'https://f2l2.reaperzclub.dpdns.org/xp1gdlr?hash=AgADhC&dl=1'
 
 jobs:
-  upscale_and_upload:
+  real_ai_upscale:
     runs-on: ubuntu-latest
     steps:
-      - name: Install System Dependencies
+      - name: Free Runner Space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+
+      - name: Install System Tools & AI Engines
         run: |
           sudo apt-get update
-          sudo apt-get install -y aria2 ffmpeg jq python3-pip curl
+          sudo apt-get install -y aria2 ffmpeg jq curl wget unzip
+          wget -q https://github.com/xinntao/real-esrgan/releases/download/v0.2.5.0/realesrgan-ncnn-vulkan-20220424-ubuntu.zip
+          unzip -q realesrgan-ncnn-vulkan-20220424-ubuntu.zip
+          chmod +x realesrgan-ncnn-vulkan
 
-      - name: Download Input Video
+      - name: Download Source Video
         run: |
           aria2c -x 16 -s 16 -k 1M "${{ inputs.video_url }}" -o "input.mp4"
 
-      - name: Extract Lossless Audio
+      - name: Extract Audio
         run: |
           ffmpeg -i input.mp4 -vn -c:a copy pure_audio.aac || touch pure_audio.aac
 
-      - name: 4K AI Upscaling (Lanczos + Unsharp Masking)
+      - name: Pure Deep-Learning AI Upscaling (Segmented & Disk Safe)
         run: |
-          # 3-Second Outro Title Card
+          mkdir -p chunks upscaled_parts
+          ffmpeg -i input.mp4 -c copy -map 0:v -segment_time 60 -f segment -reset_timestamps 1 chunks/part_%04d.mp4
+          rm -f input.mp4
+
+          FPS=$(ffprobe -v error -select_streams v:0 -show_entries stream=r_frame_rate -of default=noprint_wrappers=1:nokey=1 chunks/part_0000.mp4)
+
+          for part in chunks/part_*.mp4; do
+            [ -e "$part" ] || continue
+            bname=$(basename "$part" .mp4)
+            mkdir -p in_frames out_frames
+
+            ffmpeg -i "$part" -qscale:v 1 in_frames/frame_%06d.png
+            rm -f "$part"
+
+            ./realesrgan-ncnn-vulkan -i in_frames -o out_frames -n realesrgan-x4plus -s 4
+            rm -rf in_frames
+
+            ffmpeg -r "$FPS" -i out_frames/frame_%06d.png -c:v libx264 -crf 15 -preset medium -pix_fmt yuv420p "upscaled_parts/${bname}.mp4"
+            rm -rf out_frames
+          done
+
+          printf "file '%s'\n" upscaled_parts/*.mp4 > parts_list.txt
+          ffmpeg -f concat -safe 0 -i parts_list.txt -c copy master_ai.mp4
+          rm -rf chunks upscaled_parts
+
+      - name: Add 3s Vikky Outro & Mux Pure Audio
+        run: |
           ffmpeg -f lavfi -i color=c=black:s=3840x2160:d=3 -vf "drawtext=text='AI Upscale 4K by Vikky':fontcolor=white:fontsize=80:x=(w-text_w)/2:y=(h-text_h)/2" -c:v libx264 -pix_fmt yuv420p outro.mp4
+          printf "file 'master_ai.mp4'\nfile 'outro.mp4'\n" > merge_list.txt
+          ffmpeg -f concat -safe 0 -i merge_list.txt -c copy combined.mp4
 
-          # High-Precision 4K Upscale & Sharpening
-          ffmpeg -i input.mp4 -vf "scale=3840:2160:flags=lanczos,unsharp=5:5:1.0:5:5:0.0" -c:v libx264 -profile:v high -level 5.1 -crf 17 -preset slow -pix_fmt yuv420p upscaled_video.mp4
-
-          # Merge Outro
-          printf "file 'upscaled_video.mp4'\nfile 'outro.mp4'\n" > merge_list.txt
-          ffmpeg -f concat -safe 0 -i merge_list.txt -c copy merged_raw.mp4
-
-          # Combine with Pure Audio
           if [ -s pure_audio.aac ]; then
-            ffmpeg -i merged_raw.mp4 -i pure_audio.aac -c:v copy -c:a copy -map 0:v:0 -map 1:a:0? -movflags +faststart final_output_4k.mp4
+            ffmpeg -i combined.mp4 -i pure_audio.aac -c:v copy -c:a copy -map 0:v:0 -map 1:a:0? -movflags +faststart final_4k_output.mp4
           else
-            ffmpeg -i merged_raw.mp4 -c:v copy -movflags +faststart final_output_4k.mp4
+            ffmpeg -i combined.mp4 -c:v copy -movflags +faststart final_4k_output.mp4
           fi
 
-      - name: Upload Output to Gofile
+      - name: Upload to Gofile
+        id: gofile
         run: |
           SERVER=$(curl -s https://api.gofile.io/servers | jq -r '.data.servers[0].name')
-          UPLOAD_RES=$(curl -F "file=@final_output_4k.mp4" "https://${SERVER}.gofile.io/contents/uploadfile")
+          UPLOAD_RES=$(curl -F "file=@final_4k_output.mp4" "https://${SERVER}.gofile.io/contents/uploadfile")
           DOWNLOAD_PAGE=$(echo $UPLOAD_RES | jq -r '.data.downloadPage')
+          echo "DOWNLOAD_PAGE=$DOWNLOAD_PAGE" >> $GITHUB_ENV
+          echo "Download link: $DOWNLOAD_PAGE"
 
-          echo "======================================================="
-          echo "4K UPSCALE COMPLETE!"
-          echo "GOFILE DOWNLOAD LINK: $DOWNLOAD_PAGE"
-          echo "======================================================="
+      - name: Send Direct Link to Telegram
+        if: env.DOWNLOAD_PAGE != ''
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TG_BOT_TOKEN }}/sendMessage" \
+            -d chat_id="${{ secrets.TG_CHAT_ID }}" \
+            -d text="🎉 Real AI 4K Upscale aipoyindi bro!%0AModel: Real-ESRGAN x4plus (Zero Fake Filters)%0AOutro: AI Upscale 4K by Vikky%0ADownload Link: ${{ env.DOWNLOAD_PAGE }}"
