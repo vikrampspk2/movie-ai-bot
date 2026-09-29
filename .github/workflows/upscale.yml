@@ -162,5 +162,6 @@ jobs:
           GO=$(curl -fL --retry 5 -F "file=@$FINAL" https://upload.gofile.io/uploadfile|jq -r '.data.downloadPage//empty')
           J=$(curl -fL --retry 5 -T "$FINAL" "https://w.buzzheavier.com/$FINAL");BID=$(echo "$J"|jq -r '.data.id//empty');test -n "$GO" -a -n "$BID";BZ="https://buzzheavier.com/$BID"
           [ "$DONE_N" -eq "$TOTAL_N" ]&&ST=complete||ST=partial
+          save(){ b=$(base64 -w0 state/s.json); old=$(gh api "repos/$GITHUB_REPOSITORY/contents/$STATE?ref=main" --jq .sha 2>/dev/null||true); if [ -n "$old" ];then gh api --method PUT "repos/$GITHUB_REPOSITORY/contents/$STATE" -f message="video-state $ID $ST" -f content="$b" -f branch=main -f sha="$old" >/dev/null;else gh api --method PUT "repos/$GITHUB_REPOSITORY/contents/$STATE" -f message="video-state $ID $ST" -f content="$b" -f branch=main >/dev/null;fi; }
           jq --arg st "$ST" --arg go "$GO" --arg bz "$BZ" --argjson d "$DONE_N" --argjson t "$TOTAL_N" '.status=$st|.final_links={gofile:$go,buzzheavier:$bz}|.completed_chunks=$d|.total_chunks=$t' state/s.json > state/t;mv state/t state/s.json;save
           echo "VIDEO ID: $ID";echo "SHA-256: $SHA";echo "FRAMES: $FRAMES";echo "CHUNKS: $DONE_N/$TOTAL_N";echo "STATUS: $ST";echo "GOFILE: $GO";echo "BUZZHEAVIER: $BZ"
