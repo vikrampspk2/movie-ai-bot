@@ -1,4 +1,4 @@
-name: Vikky Universal 4K AI Upscaler
+name: Vikky Theater-Grade 4K AI Upscaler
 
 on:
   workflow_dispatch:
@@ -9,42 +9,40 @@ on:
         type: string
 
 jobs:
-  real_ai_upscale:
+  theater_ai_upscale:
     runs-on: ubuntu-latest
     steps:
       - name: Free Runner Space
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
 
-      - name: Install Tools & Real-ESRGAN Engine
+      - name: Install Dependencies & Tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y aria2 ffmpeg jq curl wget unzip python3-pip
-          pip install --no-cache-dir yt-dlp
-          
-          # Real-ESRGAN Vulkan portable binary
-          wget -q https://github.com/xinntao/real-esrgan/releases/download/v0.2.5.0/realesrgan-ncnn-vulkan-20220424-ubuntu.zip
-          unzip -q realesrgan-ncnn-vulkan-20220424-ubuntu.zip
-          chmod +x realesrgan-ncnn-vulkan
+          sudo apt-get install -y aria2 ffmpeg jq curl wget python3-pip
 
-      - name: Universal Video Downloader (Any Link Supported)
+      - name: Setup CPU PyTorch & Real-ESRGAN Neural Weights
+        run: |
+          pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          pip install --no-cache-dir realesrgan yt-dlp
+          mkdir -p weights
+          wget -q -O weights/RealESRGAN_x4plus.pth https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth
+
+      - name: Universal Video Downloader
         run: |
           TARGET_URL="${{ inputs.video_url }}"
-          echo "Downloading from: $TARGET_URL"
-          
-          # Try yt-dlp with aria2 first (handles GDrive, streaming sites, direct links)
+          echo "Downloading source: $TARGET_URL"
           yt-dlp --external-downloader aria2c --external-downloader-args "-x 16 -s 16 -k 1M" "$TARGET_URL" -o "input.mp4" || \
           aria2c -x 16 -s 16 -k 1M "$TARGET_URL" -o "input.mp4" || \
           curl -L "$TARGET_URL" -o "input.mp4"
 
-      - name: Extract Audio Track
+      - name: Extract Lossless Audio
         run: |
           ffmpeg -i input.mp4 -vn -c:a copy pure_audio.aac || touch pure_audio.aac
 
-      - name: Deep Learning Real-ESRGAN Processing (Safe Chunking)
+      - name: Frame-by-Frame Deep Learning AI Upscaling (Disk Safe)
         run: |
           mkdir -p chunks upscaled_parts
-          # 60-second chunking prevents runner disk crashes
           ffmpeg -i input.mp4 -c copy -map 0:v -segment_time 60 -f segment -reset_timestamps 1 chunks/part_%04d.mp4
           rm -f input.mp4
 
@@ -58,11 +56,18 @@ jobs:
             ffmpeg -i "$part" -qscale:v 1 in_frames/frame_%06d.png
             rm -f "$part"
 
-            # Pure Deep Learning AI Upscaling (realesrgan-x4plus)
-            ./realesrgan-ncnn-vulkan -i in_frames -o out_frames -n realesrgan-x4plus -s 4
+            python3 -m realesrgan.inference_realesrgan \
+              -n RealESRGAN_x4plus \
+              --model_path weights/RealESRGAN_x4plus.pth \
+              -i in_frames \
+              -o out_frames \
+              --outscale 4 \
+              --ext png \
+              --device cpu
+
             rm -rf in_frames
 
-            ffmpeg -r "$FPS" -i out_frames/frame_%06d.png -c:v libx264 -crf 15 -preset medium -pix_fmt yuv420p "upscaled_parts/${bname}.mp4"
+            ffmpeg -r "$FPS" -i out_frames/frame_%06d_out.png -c:v libx265 -crf 18 -preset fast -pix_fmt yuv420p "upscaled_parts/${bname}.mp4"
             rm -rf out_frames
           done
 
@@ -70,25 +75,34 @@ jobs:
           ffmpeg -f concat -safe 0 -i parts_list.txt -c copy master_ai.mp4
           rm -rf chunks upscaled_parts
 
-      - name: Attach Vikky Outro & Mux Audio
+      - name: Create 3s Vikky Outro & Final Mux
         run: |
-          ffmpeg -f lavfi -i color=c=black:s=3840x2160:d=3 -vf "drawtext=text='AI Upscale 4K by Vikky':fontcolor=white:fontsize=80:x=(w-text_w)/2:y=(h-text_h)/2" -c:v libx264 -pix_fmt yuv420p outro.mp4
+          ffmpeg -f lavfi -i color=c=black:s=3840x2160:d=3 -vf "drawtext=text='AI Upscale 4K by Vikky':fontcolor=white:fontsize=80:x=(w-text_w)/2:y=(h-text_h)/2" -c:v libx265 -crf 18 -preset fast -pix_fmt yuv420p outro.mp4
           printf "file 'master_ai.mp4'\nfile 'outro.mp4'\n" > merge_list.txt
           ffmpeg -f concat -safe 0 -i merge_list.txt -c copy combined.mp4
 
           if [ -s pure_audio.aac ]; then
-            ffmpeg -i combined.mp4 -i pure_audio.aac -c:v copy -c:a copy -map 0:v:0 -map 1:a:0? -movflags +faststart final_4k_output.mp4
+            ffmpeg -i combined.mp4 -i pure_audio.aac -c:v copy -c:a copy -map 0:v:0 -map 1:a:0? -movflags +faststart final_theater_4k.mp4
           else
-            ffmpeg -i combined.mp4 -c:v copy -movflags +faststart final_4k_output.mp4
+            ffmpeg -i combined.mp4 -c:v copy -movflags +faststart final_theater_4k.mp4
           fi
 
-      - name: Upload to Gofile
+      - name: Dual Upload (Gofile & Buzzheavier)
         run: |
-          SERVER=$(curl -s https://api.gofile.io/servers | jq -r '.data.servers[0].name')
-          UPLOAD_RES=$(curl -F "file=@final_4k_output.mp4" "https://${SERVER}.gofile.io/contents/uploadfile")
-          DOWNLOAD_PAGE=$(echo $UPLOAD_RES | jq -r '.data.downloadPage')
-          
+          GOFILE_SERVER=$(curl -s https://api.gofile.io/servers | jq -r '.data.servers[0].name')
+          GOFILE_RES=$(curl -F "file=@final_theater_4k.mp4" "https://${GOFILE_SERVER}.gofile.io/contents/uploadfile")
+          GOFILE_LINK=$(echo $GOFILE_RES | jq -r '.data.downloadPage')
+
+          BUZZ_RES=$(curl -s -F "file=@final_theater_4k.mp4" https://buzzheavier.com/api/upload)
+          BUZZ_ID=$(echo $BUZZ_RES | jq -r '.data.id // empty')
+          if [ -n "$BUZZ_ID" ]; then
+            BUZZ_LINK="https://buzzheavier.com/${BUZZ_ID}"
+          else
+            BUZZ_LINK=$(echo $BUZZ_RES | jq -r '.data.url // "Upload pending/manual check"')
+          fi
+
           echo "=========================================================="
-          echo "🎉 4K REAL-ESRGAN UPSCALE COMPLETED SUCCESSFULLY!"
-          echo "🔗 GOFILE DOWNLOAD LINK: $DOWNLOAD_PAGE"
+          echo "🎬 THEATER-GRADE 4K UPSCALE COMPLETE!"
+          echo "🔗 GOFILE LINK: $GOFILE_LINK"
+          echo "🔗 BUZZHEAVIER LINK: $BUZZ_LINK"
           echo "=========================================================="
