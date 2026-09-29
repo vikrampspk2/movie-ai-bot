@@ -1,7 +1,2 @@
-fastapi
-uvicorn
-httpx
-pyrogram==2.0.106
-tgcrypto
-kaggle
-pydantic-settings
+python-telegram-bot==20.7
+requests==2.31.0
