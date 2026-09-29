@@ -17,6 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       VIDEO_URL: ${{ inputs.video_url || github.event.client_payload.url }}
       SAFE: "19800"
       RESERVE: "1200"
@@ -30,6 +31,9 @@ jobs:
           sudo apt-get install -y --no-install-recommends ffmpeg aria2 curl wget git gh jq fonts-dejavu
           python3 -m pip install --upgrade pip
           python3 -m pip install --no-cache-dir yt-dlp bhdownloader numpy
+          STATE_BRANCH=$(gh repo view "$GITHUB_REPOSITORY" --json defaultBranchRef --jq '.defaultBranchRef.name' 2>/dev/null || true)
+          [ -n "$STATE_BRANCH" ] || STATE_BRANCH="main"
+          echo "STATE_BRANCH=$STATE_BRANCH" >> "$GITHUB_ENV"
           echo "START=$(date +%s)" >> "$GITHUB_ENV"
 
       - name: Download and content identity
@@ -48,9 +52,29 @@ jobs:
           ID="$SHA-$FRAMES"; STATE=".video_state/$ID.json"
           printf 'SHA=%s\nFRAMES=%s\nFPS=%s\nW=%s\nH=%s\nID=%s\nSTATE=%s\n' "$SHA" "$FRAMES" "$FPS" "$W" "$H" "$ID" "$STATE" >> "$GITHUB_ENV"
           mkdir -p state
-          if ! gh api "repos/$GITHUB_REPOSITORY/contents/$STATE?ref=main" --jq .content 2>/dev/null | tr -d '\n' | base64 -d > state/s.json; then
+          STATE_B64=$(gh api "repos/$GITHUB_REPOSITORY/contents/$STATE?ref=$STATE_BRANCH" --jq '.content // empty' 2>/dev/null || true)
+          if [ -n "$STATE_B64" ] && printf '%s' "$STATE_B64" | tr -d '\n' | base64 -d > state/s.download.json 2>/dev/null && jq -e . state/s.download.json >/dev/null 2>&1; then
+            mv state/s.download.json state/s.json
+          else
+            rm -f state/s.download.json
             jq -n --arg id "$ID" --arg sha "$SHA" --arg fps "$FPS" --argjson f "$FRAMES" --argjson w "$W" --argjson h "$H" \
               '{video_id:$id,sha256:$sha,frame_count:$f,fps:$fps,width:$w,height:$h,status:"new",chunks:{},final_links:{}}' > state/s.json
+          fi
+          jq '
+            .video_id=(.video_id // "") |
+            .sha256=(.sha256 // "") |
+            .frame_count=(.frame_count // 0) |
+            .fps=(.fps // "") |
+            .width=(.width // 0) |
+            .height=(.height // 0) |
+            .status=(.status // "new") |
+            .chunks=(if (.chunks|type)=="object" then .chunks else {} end) |
+            .final_links=(if (.final_links|type)=="object" then .final_links else {} end)
+          ' state/s.json > state/s.normalized.json 2>/dev/null || true
+          if [ -s state/s.normalized.json ] && jq -e . state/s.normalized.json >/dev/null 2>&1; then
+            mv state/s.normalized.json state/s.json
+          else
+            rm -f state/s.normalized.json
           fi
           if [ "$(jq -r .status state/s.json)" = complete ] && [ "$(jq -r .sha256 state/s.json)" = "$SHA" ]; then
             GO=$(jq -r .final_links.gofile state/s.json); BZ=$(jq -r .final_links.buzzheavier state/s.json)
@@ -118,7 +142,17 @@ jobs:
             e=min(total,(i+1)*per);print(i,s,e-s,float(Fraction(s,1)/fps));s=e;i+=1
           PY
           TOTAL=$(wc -l < work/p); echo "TOTAL=$TOTAL" >> "$GITHUB_ENV"
-          save(){ b=$(base64 -w0 state/s.json); old=$(gh api "repos/$GITHUB_REPOSITORY/contents/$STATE?ref=main" --jq .sha 2>/dev/null||true); if [ -n "$old" ];then gh api --method PUT "repos/$GITHUB_REPOSITORY/contents/$STATE" -f message="video-state $ID" -f content="$b" -f branch=main -f sha="$old" >/dev/null;else gh api --method PUT "repos/$GITHUB_REPOSITORY/contents/$STATE" -f message="video-state $ID" -f content="$b" -f branch=main >/dev/null;fi; }
+          save(){
+            jq -e . state/s.json >/dev/null 2>&1 || { echo "WARNING: invalid local state; skipping save." >&2; return 0; }
+            b=$(base64 -w0 state/s.json 2>/dev/null) || { echo "WARNING: state encoding failed." >&2; return 0; }
+            old=$(gh api "repos/$GITHUB_REPOSITORY/contents/$STATE?ref=$STATE_BRANCH" --jq '.sha // empty' 2>/dev/null || true)
+            if [ -n "$old" ]; then
+              gh api --method PUT "repos/$GITHUB_REPOSITORY/contents/$STATE" -f message="video-state $ID" -f content="$b" -f branch="$STATE_BRANCH" -f sha="$old" >/dev/null 2>&1 || echo "WARNING: checkpoint update failed."
+            else
+              gh api --method PUT "repos/$GITHUB_REPOSITORY/contents/$STATE" -f message="video-state $ID" -f content="$b" -f branch="$STATE_BRANCH" >/dev/null 2>&1 || echo "WARNING: checkpoint creation failed."
+            fi
+            return 0
+          }
           jq '.status="partial"' state/s.json > state/t;mv state/t state/s.json;save
           while read -r I S N SEC;do
             if jq -e --arg i "$I" '.chunks[$i].buzz // empty' state/s.json >/dev/null 2>&1;then echo "SKIP $I";continue;fi
@@ -129,8 +163,21 @@ jobs:
             R=$?;set -e
             [ "$R" -eq 0 ]&&[ -s chunks/c.ts ]||{ rm -f chunks/c.ts;break; }
             SUM=$(sha256sum chunks/c.ts|awk '{print $1}');NAME="vikky_$ID_chunk_$(printf '%04d' "$I").ts"
-            J=$(curl -fL --retry 5 -T chunks/c.ts "https://w.buzzheavier.com/$NAME");BID=$(echo "$J"|jq -r '.data.id//empty');test -n "$BID"
-            jq --arg i "$I" --arg u "https://buzzheavier.com/$BID" --arg s "$SUM" --argjson n "$N" '.chunks[$i]={buzz:$u,sha256:$s,frames:$n}' state/s.json > state/t;mv state/t state/s.json;save
+            J=$(curl -fL --retry 5 --retry-all-errors -T chunks/c.ts "https://w.buzzheavier.com/$NAME" 2>/dev/null || true)
+            BID=$(printf '%s' "$J" | jq -r '.data.id // empty' 2>/dev/null || true)
+            if [ -z "$BID" ]; then
+              echo "WARNING: chunk $I upload failed; checkpoint not advanced."
+              rm -f chunks/c.ts
+              break
+            fi
+            if jq --arg i "$I" --arg u "https://buzzheavier.com/$BID" --arg s "$SUM" --argjson n "$N" '.chunks[$i]={buzz:$u,sha256:$s,frames:$n}' state/s.json > state/t 2>/dev/null; then
+              mv state/t state/s.json
+              save
+            else
+              echo "WARNING: failed to update checkpoint for chunk $I."
+              rm -f state/t chunks/c.ts
+              break
+            fi
             rm -f chunks/c.ts
           done < work/p
           rm -f input.mp4
@@ -139,19 +186,27 @@ jobs:
         if: ${{ env.DONE != 'true' }}
         run: |
           set -euo pipefail
-          DONE_N=$(jq '.chunks|length' state/s.json);TOTAL_N=$TOTAL
-          [ "$DONE_N" -gt 0 ]||exit 0
+          DONE_N=$(jq '.chunks|length' state/s.json 2>/dev/null || echo 0)
+          TOTAL_N=$TOTAL
+          [ "$DONE_N" -gt 0 ] || { echo "No completed chunks yet; state retained for resume."; exit 0; }
           mkdir -p merge;:>merge/l
           for I in $(jq -r '.chunks|keys[]' state/s.json|sort -n);do
-            P=$(jq -r --arg i "$I" '.chunks[$i].buzz' state/s.json)
+            P=$(jq -r --arg i "$I" '.chunks[$i].buzz // empty' state/s.json 2>/dev/null || true)
+            [ -n "$P" ] || continue
             D=$(python3 - "$P" <<'PY'
           import sys
           from bhdownloader import get_download_link
-          r=get_download_link(sys.argv[1]);print(r[0] if isinstance(r,tuple) else getattr(r,"download_url",r))
+          try:
+              r=get_download_link(sys.argv[1])
+              print(r[0] if isinstance(r,tuple) else getattr(r,"download_url",r))
+          except Exception:
+              pass
           PY
-            )
+            ) || true
+            [ -n "$D" ] || continue
             printf "file '%s'\n" "$D" >> merge/l
           done
+          [ -s merge/l ] || { echo "No downloadable completed chunks; state retained for resume."; exit 0; }
           ffmpeg -hide_banner -loglevel warning -y -protocol_whitelist file,http,https,tcp,tls,crypto -f concat -safe 0 -i merge/l -c copy merge/ai.ts
           SIZE="$W"x"$H"
           ffmpeg -hide_banner -loglevel warning -y -f lavfi -i "color=c=black:s=$SIZE:d=3:r=$FPS" -vf "drawtext=text='AI Upscale 4K by Vikky':fontcolor=white:fontsize=80:x=(w-text_w)/2:y=(h-text_h)/2" -c:v libx265 -crf 16 -preset fast -pix_fmt yuv420p -f mpegts merge/o.ts
@@ -162,6 +217,6 @@ jobs:
           GO=$(curl -fL --retry 5 -F "file=@$FINAL" https://upload.gofile.io/uploadfile|jq -r '.data.downloadPage//empty')
           J=$(curl -fL --retry 5 -T "$FINAL" "https://w.buzzheavier.com/$FINAL");BID=$(echo "$J"|jq -r '.data.id//empty');test -n "$GO" -a -n "$BID";BZ="https://buzzheavier.com/$BID"
           [ "$DONE_N" -eq "$TOTAL_N" ]&&ST=complete||ST=partial
-          save(){ b=$(base64 -w0 state/s.json); old=$(gh api "repos/$GITHUB_REPOSITORY/contents/$STATE?ref=main" --jq .sha 2>/dev/null||true); if [ -n "$old" ];then gh api --method PUT "repos/$GITHUB_REPOSITORY/contents/$STATE" -f message="video-state $ID $ST" -f content="$b" -f branch=main -f sha="$old" >/dev/null;else gh api --method PUT "repos/$GITHUB_REPOSITORY/contents/$STATE" -f message="video-state $ID $ST" -f content="$b" -f branch=main >/dev/null;fi; }
+          save(){ b=$(base64 -w0 state/s.json); old=$(gh api "repos/$GITHUB_REPOSITORY/contents/$STATE?ref=$STATE_BRANCH" --jq .sha 2>/dev/null||true); if [ -n "$old" ];then gh api --method PUT "repos/$GITHUB_REPOSITORY/contents/$STATE" -f message="video-state $ID $ST" -f content="$b" -f branch="$STATE_BRANCH" -f sha="$old" >/dev/null;else gh api --method PUT "repos/$GITHUB_REPOSITORY/contents/$STATE" -f message="video-state $ID $ST" -f content="$b" -f branch="$STATE_BRANCH" >/dev/null;fi; }
           jq --arg st "$ST" --arg go "$GO" --arg bz "$BZ" --argjson d "$DONE_N" --argjson t "$TOTAL_N" '.status=$st|.final_links={gofile:$go,buzzheavier:$bz}|.completed_chunks=$d|.total_chunks=$t' state/s.json > state/t;mv state/t state/s.json;save
           echo "VIDEO ID: $ID";echo "SHA-256: $SHA";echo "FRAMES: $FRAMES";echo "CHUNKS: $DONE_N/$TOTAL_N";echo "STATUS: $ST";echo "GOFILE: $GO";echo "BUZZHEAVIER: $BZ"
