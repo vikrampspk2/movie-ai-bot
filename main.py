@@ -47,11 +47,11 @@ if not API_HASH or not BOT_TOKEN:
 PORT = int(os.environ.get("PORT", 8080))
 
 bot = Client(
-    "render_prod_stream_bot_clean",
+    "render_stream_bot_session",
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
-    workdir="/tmp"
+    in_memory=True
 )
 
 web_server = Flask(__name__)
