@@ -46,6 +46,17 @@ if not API_HASH or not BOT_TOKEN:
     raise SystemExit(1)
 PORT = int(os.environ.get("PORT", 8080))
 
+def purge_webhook():
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook?drop_pending_updates=True"
+    try:
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        logger.info("Telegram webhook purge response: %s", response.text)
+    except requests.RequestException as exc:
+        logger.warning("Telegram webhook purge failed: %s", exc)
+    except Exception:
+        logger.exception("Unexpected webhook purge error.")
+
 bot = Client(
     "movie_ai_bot_runtime",
     api_id=API_ID,
