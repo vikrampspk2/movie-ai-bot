@@ -326,11 +326,34 @@ async def handle_uphoster(_, message: Message):
     else:
         await status_msg.edit_text("❌ **Upload Failed:** Connection lost or mirrors rejected the stream.")
 
-if __name__ == "__main__":
+async def main():
     threading.Thread(target=start_keep_alive, daemon=True).start()
-    logger.info("Starting Pyrogram client...")
+    logger.info("Initializing Telegram Bot...")
+
     try:
-        bot.run()
+        logger.info("Clearing any old webhooks...")
+        response = requests.get(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook?drop_pending_updates=True",
+            timeout=10
+        )
+        response.raise_for_status()
+        logger.info("Telegram webhook cleared successfully.")
+    except Exception as e:
+        logger.warning(f"Could not clear webhook via API: {e}")
+
+    try:
+        await bot.start()
+        bot_info = await bot.get_me()
+        logger.info(f"SUCCESS: Bot is online and listening as @{bot_info.username}")
+        await idle()
     except Exception:
-        logger.exception("Pyrogram client initialization/runtime failed.")
+        logger.exception("Pyrogram client startup/runtime failed.")
         raise
+    finally:
+        try:
+            await bot.stop()
+        except Exception:
+            pass
+
+if __name__ == "__main__":
+    asyncio.run(main())
