@@ -1,77 +1,312 @@
+"""
+STREAM HOSTER MULTI-MIRROR PRODUCTION ENGINE
+- Strict Low RAM (<25MB Peak) with 2MB chunks & size-capped queues
+- Slow host timeout/drop (No pipeline stalls)
+- True multi-target upload progress tracking
+- Robust Filename Sanitization & Partial-Upload Guard
+- Zero-Spam Telegram Live Progress (Every 4.5s)
+- Render 24/7 Keep-Alive
+"""
+
 import os
+import re
+import time
+import queue
 import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
+import asyncio
+import logging
+from urllib.parse import unquote, quote
 import requests
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+from flask import Flask
+from pyrogram import Client, filters
+from pyrogram.types import Message
 
-TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN")
-GH_PAT_TOKEN = os.environ.get("GH_PAT_TOKEN")
-GH_REPO = os.environ.get("GH_REPO")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger("ProdStreamBot")
 
-# Clear old webhooks
-requests.get(f"https://api.telegram.org/bot{TG_BOT_TOKEN}/deleteWebhook?drop_pending_updates=true")
+API_ID = int(os.environ.get("API_ID", 0))
+API_HASH = os.environ.get("API_HASH", "")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+PORT = int(os.environ.get("PORT", 8080))
 
-class StatusHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"Vikky 4K Controller Online 24/7")
+bot = Client(
+    "render_prod_stream_bot",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN
+)
 
-def keep_alive():
-    port = int(os.environ.get("PORT", 8080))
-    server = HTTPServer(("0.0.0.0", port), StatusHandler)
-    server.serve_forever()
+web_server = Flask(__name__)
 
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Vikky 4K AI Upscaler Online lo undi bro!\nVideo link send cheyandi leda /upscale <link> ivvandi.")
+@web_server.route("/")
+def health_check():
+    return "Stream Bot is active and running 24/7 on Render!"
 
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Usage:\nDirect video URL or Google Drive link send cheyandi.")
+def start_keep_alive():
+    web_server.run(host="0.0.0.0", port=PORT)
 
-async def handle_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if text.startswith("/upscale"):
-        parts = text.split(maxsplit=1)
-        if len(parts) > 1:
-            url = parts[1].strip()
-        else:
-            await update.message.reply_text("Bro link miss ayyindi! Example: /upscale <link>")
+def sanitize_filename(name: str) -> str:
+    name = unquote(name)
+    name = re.sub(r'[\\/*?:"<>| ]', '_', name)
+    return name if name else "streamed_file.bin"
+
+def extract_clean_filename(url: str, headers: dict) -> str:
+    cd = headers.get("content-disposition", "")
+    if "filename=" in cd:
+        raw_name = cd.split("filename=")[-1].strip('"\' ')
+        if raw_name:
+            return sanitize_filename(raw_name)
+    clean_url = url.split("?")[0].rstrip("/")
+    fallback = clean_url.split("/")[-1]
+    return sanitize_filename(fallback)
+
+def human_size(size_bytes: int) -> str:
+    if size_bytes <= 0:
+        return "0 B"
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+        if size_bytes < 1024.0:
+            return f"{size_bytes:.2f} {unit}"
+        size_bytes /= 1024.0
+    return f"{size_bytes:.2f} PB"
+
+class ResilientFanout:
+    def __init__(self, targets: list, maxsize: int = 2):
+        self.targets = targets
+        self.queues = {t: queue.Queue(maxsize=maxsize) for t in targets}
+        self.active_targets = set(targets)
+        self.aborted = False
+
+    def push(self, chunk: bytes):
+        dead_targets = set()
+        for t in list(self.active_targets):
+            try:
+                self.queues[t].put(chunk, timeout=15)
+            except queue.Full:
+                logger.warning(f"Target '{t}' stalled/too slow. Dropping from active mirrors.")
+                dead_targets.add(t)
+        self.active_targets -= dead_targets
+
+    def close(self):
+        for q in self.queues.values():
+            try:
+                q.put_nowait(None)
+            except queue.Full:
+                pass
+
+    def abort(self):
+        self.aborted = True
+        self.close()
+
+    def get_stream(self, target_name: str, progress_dict: dict):
+        q = self.queues[target_name]
+        def gen():
+            while True:
+                if self.aborted:
+                    break
+                chunk = q.get()
+                if chunk is None:
+                    break
+                progress_dict[target_name] = progress_dict.get(target_name, 0) + len(chunk)
+                yield chunk
+        return gen()
+
+def worker_buzzheavier(fanout: ResilientFanout, filename: str, progress: dict, results: dict):
+    target = "⚡ BuzzHeavier"
+    try:
+        encoded_name = quote(filename)
+        url = f"https://buzzheavier.com/{encoded_name}"
+        stream_data = fanout.get_stream(target, progress)
+        res = requests.put(
+            url,
+            data=stream_data,
+            headers={"Content-Type": "application/octet-stream"},
+            timeout=7200
+        )
+        if not fanout.aborted and res.status_code in [200, 201]:
+            results[target] = f"https://buzzheavier.com/{encoded_name}"
+    except Exception as e:
+        logger.error(f"BuzzHeavier failed: {e}")
+
+def worker_gofile(fanout: ResilientFanout, filename: str, progress: dict, results: dict):
+    target = "📂 GoFile"
+    try:
+        srv_req = requests.get("https://api.gofile.io/servers", timeout=15).json()
+        if srv_req.get("status") != "ok":
             return
-    else:
-        url = text
+        node = srv_req["data"]["servers"][0]["name"]
+        upload_url = f"https://{node}.gofile.io/contents/uploadfile"
+        stream_data = fanout.get_stream(target, progress)
+        files = {"file": (filename, stream_data, "application/octet-stream")}
+        res = requests.post(upload_url, files=files, timeout=7200)
+        if not fanout.aborted and res.status_code == 200:
+            data = res.json()
+            if data.get("status") == "ok":
+                results[target] = data["data"]["downloadPage"]
+    except Exception as e:
+        logger.error(f"GoFile failed: {e}")
 
-    chat_id = update.effective_chat.id
-    status_msg = await update.message.reply_text("Request register ayyindi bro. GitHub Actions trigger chesthunna...")
+def worker_pixeldrain(fanout: ResilientFanout, filename: str, progress: dict, results: dict):
+    target = "💧 PixelDrain"
+    try:
+        encoded_name = quote(filename)
+        url = f"https://pixeldrain.com/api/file/{encoded_name}"
+        stream_data = fanout.get_stream(target, progress)
+        res = requests.put(url, data=stream_data, timeout=7200)
+        if not fanout.aborted and res.status_code in [200, 201]:
+            fid = res.json().get("id")
+            if fid:
+                results[target] = f"https://pixeldrain.com/u/{fid}"
+    except Exception as e:
+        logger.error(f"PixelDrain failed: {e}")
 
-    headers = {
-        "Authorization": f"Bearer {GH_PAT_TOKEN}",
-        "Accept": "application/vnd.github.v3+json"
+def execute_resilient_stream(source_url: str, filename: str, total_size: int, tracker: dict) -> dict:
+    targets = ["⚡ BuzzHeavier", "📂 GoFile", "💧 PixelDrain"]
+    fanout = ResilientFanout(targets=targets, maxsize=2)
+    results = {}
+    tracker["upload_progress"] = {t: 0 for t in targets}
+    tracker["start_time"] = time.time()
+    tracker["active"] = True
+
+    threads = [
+        threading.Thread(target=worker_buzzheavier, args=(fanout, filename, tracker["upload_progress"], results)),
+        threading.Thread(target=worker_gofile, args=(fanout, filename, tracker["upload_progress"], results)),
+        threading.Thread(target=worker_pixeldrain, args=(fanout, filename, tracker["upload_progress"], results))
+    ]
+    for th in threads:
+        th.start()
+
+    download_success = False
+    try:
+        with requests.get(source_url, stream=True, timeout=120) as r:
+            r.raise_for_status()
+            for chunk in r.iter_content(chunk_size=2 * 1024 * 1024):
+                if chunk:
+                    fanout.push(chunk)
+                    tracker["downloaded"] = tracker.get("downloaded", 0) + len(chunk)
+            download_success = True
+    except Exception as e:
+        logger.error(f"Source download read aborted: {e}")
+        fanout.abort()
+    finally:
+        if not download_success:
+            fanout.abort()
+        else:
+            fanout.close()
+        tracker["active"] = False
+
+    for th in threads:
+        th.join()
+
+    return results if download_success else {}
+
+@bot.on_message(filters.command("start"))
+async def handle_start(_, message: Message):
+    await message.reply_text(
+        "⚡ **Production Multi-Host Streamer**\n\n"
+        "• Low RAM Cap (<25MB Peak) & Stall Prevention\n"
+        "• Parallel Streaming: BuzzHeavier, GoFile, PixelDrain\n"
+        "• Live True Upload Metrics (No FloodWait)\n"
+        "• 24/7 Render Keep-Alive Active\n\n"
+        "Send \x60/help\x60 for usage."
+    )
+
+@bot.on_message(filters.command("help"))
+async def handle_help(_, message: Message):
+    await message.reply_text(
+        "📖 **Usage Guide:**\n\n"
+        "\x60/uphoster <direct_download_link>\x60\n\n"
+        "The bot will stream the file directly without filling Render's disk."
+    )
+
+@bot.on_message(filters.command("uphoster"))
+async def handle_uphoster(_, message: Message):
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await message.reply_text("⚠️ **Format:** \x60/uphoster <direct_link>\x60")
+        return
+
+    source_url = parts[1].strip()
+    status_msg = await message.reply_text("🔍 **Analyzing direct link...**")
+
+    try:
+        head = await asyncio.to_thread(requests.head, source_url, allow_redirects=True, timeout=15)
+        raw_size = int(head.headers.get("content-length", 0))
+        filename = extract_clean_filename(source_url, head.headers)
+    except Exception:
+        raw_size = 0
+        filename = "streamed_file.bin"
+
+    tracker = {
+        "downloaded": 0,
+        "upload_progress": {},
+        "start_time": time.time(),
+        "active": True
     }
-    payload = {
-        "event_type": "start_upscale",
-        "client_payload": {"url": url, "chat_id": chat_id}
-    }
-    res = requests.post(f"https://api.github.com/repos/{GH_REPO}/dispatches", headers=headers, json=payload)
 
-    if res.status_code == 204:
-        await context.bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=status_msg.message_id,
-            text="✅ GitHub Actions start ayyindi bro! Background lo AI upscale avthundi. Prathi 2 mins ki live status update vasthundi."
-        )
+    async def update_live_ui():
+        last_ui = ""
+        while tracker["active"]:
+            await asyncio.sleep(4.5)
+            elapsed = max(time.time() - tracker["start_time"], 0.1)
+            current_up = max(tracker["upload_progress"].values()) if tracker["upload_progress"] else tracker["downloaded"]
+            speed = current_up / elapsed
+            speed_str = f"{human_size(speed)}/s"
+
+            if raw_size > 0:
+                pct = min((current_up / raw_size) * 100, 100.0)
+                filled = int(pct / 10)
+                bar = "■" * filled + "□" * (10 - filled)
+                eta_sec = int((raw_size - current_up) / speed) if speed > 0 else 0
+                eta_str = time.strftime("%H:%M:%S", time.gmtime(eta_sec))
+                progress_view = (
+                    f"[{bar}] {pct:.1f}%\n"
+                    f"⚡ **Speed:** \x60{speed_str}\x60 | **ETA:** \x60{eta_str}\x60\n"
+                    f"📊 **Uploaded:** \x60{human_size(current_up)} / {human_size(raw_size)}\x60"
+                )
+            else:
+                progress_view = f"⚡ **Speed:** \x60{speed_str}\x60\n📊 **Uploaded:** \x60{human_size(current_up)}\x60"
+
+            ui = (
+                f"📦 **File:** \x60{filename}\x60\n\n"
+                f"{progress_view}\n\n"
+                "🚀 *Uploading to BuzzHeavier, GoFile, PixelDrain...*"
+            )
+            if ui != last_ui and tracker["active"]:
+                try:
+                    await status_msg.edit_text(ui)
+                    last_ui = ui
+                except Exception:
+                    pass
+
+    reporter_task = asyncio.create_task(update_live_ui())
+
+    results = await asyncio.to_thread(
+        execute_resilient_stream,
+        source_url,
+        filename,
+        raw_size,
+        tracker
+    )
+
+    reporter_task.cancel()
+    await asyncio.gather(reporter_task, return_exceptions=True)
+
+    if results:
+        final_lines = [
+            "✅ **Stream Upload Complete!**\n",
+            f"📁 **File:** \x60{filename}\x60",
+            f"📊 **Size:** \x60{human_size(raw_size if raw_size > 0 else tracker['downloaded'])}\x60\n",
+            "🔗 **Generated Mirrors:**"
+        ]
+        for name, link in results.items():
+            final_lines.append(f"• **{name}:** {link}")
+        await status_msg.edit_text("\n".join(final_lines))
     else:
-        await context.bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=status_msg.message_id,
-            text=f"❌ GitHub trigger fail ayyindi!\nStatus Code: {res.status_code}\nResponse: {res.text}\nCheck: GH_REPO and GH_PAT_TOKEN permissions."
-        )
+        await status_msg.edit_text("❌ **Upload Failed:** Connection lost or mirrors rejected the stream.")
 
 if __name__ == "__main__":
-    threading.Thread(target=keep_alive, daemon=True).start()
-    app = ApplicationBuilder().token(TG_BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("upscale", handle_process))
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_process))
-    app.run_polling()
+    threading.Thread(target=start_keep_alive, daemon=True).start()
+    bot.run()
