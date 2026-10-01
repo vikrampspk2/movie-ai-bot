@@ -18,7 +18,7 @@ import logging
 from urllib.parse import unquote, quote
 import requests
 from flask import Flask
-from pyrogram import Client, filters, idle
+from pyrogram import Client, filters
 from pyrogram.types import Message
 
 logging.basicConfig(
@@ -47,7 +47,7 @@ if not API_HASH or not BOT_TOKEN:
 PORT = int(os.environ.get("PORT", 8080))
 
 bot = Client(
-    "render_stream_bot_session",
+    "movie_ai_bot_runtime",
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
@@ -132,7 +132,7 @@ def worker_buzzheavier(fanout: ResilientFanout, filename: str, progress: dict, r
     target = "⚡ BuzzHeavier"
     try:
         encoded_name = quote(filename)
-        url = f"https://buzzheavier.com/{encoded_name}"
+        url = f"https://w.buzzheavier.com/{encoded_name}"
         stream_data = fanout.get_stream(target, progress)
         res = requests.put(
             url,
@@ -326,73 +326,23 @@ async def handle_uphoster(_, message: Message):
     else:
         await status_msg.edit_text("❌ **Upload Failed:** Connection lost or mirrors rejected the stream.")
 
-async def main():
-    threading.Thread(target=start_keep_alive, daemon=True).start()
-    logger.info("Initializing Telegram Bot...")
-
-    try:
-        logger.info("Clearing any old webhooks...")
-        response = requests.get(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook?drop_pending_updates=True",
-            timeout=10
-        )
-        response.raise_for_status()
-        logger.info("Telegram webhook cleared successfully.")
-    except Exception as e:
-        logger.warning(f"Could not clear webhook via API: {e}")
-
-    try:
-        await bot.start()
-        bot_info = await bot.get_me()
-        logger.info(f"SUCCESS: Bot is online and listening as @{bot_info.username}")
-        await idle()
-    except Exception:
-        logger.exception("Pyrogram client startup/runtime failed.")
-        raise
-    finally:
-        try:
-            await bot.stop()
-        except Exception:
-            pass
-
-async def main():
-    threading.Thread(target=start_keep_alive, daemon=True).start()
-
-    logger.info("Initializing Telegram Bot...")
-    await bot.start()
-
-    try:
-        logger.info("Clearing any old webhooks...")
-        response = requests.get(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook?drop_pending_updates=True",
-            timeout=10
-        )
-        logger.info(f"Webhook clear response: {response.text}")
-    except Exception as e:
-        logger.warning(f"Could not clear webhook via API: {e}")
-
-    bot_info = await bot.get_me()
-    logger.info(f"SUCCESS: Bot is online and listening as @{bot_info.username}")
-
-    await idle()
-    await bot.stop()
-
 if __name__ == "__main__":
-    try:
-        logger.info("Purging any conflicting webhooks from Telegram...")
-        response = requests.get(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook?drop_pending_updates=True",
-            timeout=10
-        )
-        logger.info(f"Webhook purge response: {response.text}")
-    except Exception as e:
-        logger.warning(f"Webhook purge warning: {e}")
-
-    threading.Thread(target=start_keep_alive, daemon=True).start()
-
-    logger.info("Starting Pyrogram bot client...")
-    try:
-        bot.run()
-    except Exception:
-        logger.exception("Pyrogram bot client crashed during startup/runtime.")
-        raise
+    logger.info("=== movie-ai-bot production launcher ===")
+    threading.Thread(target=start_keep_alive, daemon=True, name="flask-health").start()
+    retry_delay = 5
+    while True:
+        try:
+            logger.info("Purging any conflicting Telegram webhook before polling...")
+            purge_webhook()
+            logger.info("Starting Pyrogram bot client...")
+            bot.run()
+            logger.warning("Pyrogram stopped; restarting in %ss.", retry_delay)
+        except Exception:
+            logger.exception("Pyrogram startup/runtime exception; process will stay alive.")
+        finally:
+            try:
+                bot.stop()
+            except Exception:
+                pass
+        time.sleep(retry_delay)
+        retry_delay = min(retry_delay * 2, 60)
