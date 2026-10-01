@@ -18,7 +18,7 @@ import logging
 from urllib.parse import unquote, quote
 import requests
 from flask import Flask
-from pyrogram import Client, filters
+from pyrogram import Client, filters, idle
 from pyrogram.types import Message
 
 logging.basicConfig(
@@ -44,7 +44,11 @@ except (TypeError, ValueError):
 if not API_HASH or not BOT_TOKEN:
     logger.error("Missing API_HASH or BOT_TOKEN environment variable.")
     raise SystemExit(1)
-PORT = int(os.environ.get("PORT", 8080))
+try:
+    PORT = int(clean_env("PORT") or "8080")
+except ValueError:
+    PORT = 8080
+    logger.warning("Invalid PORT; falling back to 8080.")
 
 def purge_webhook():
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook?drop_pending_updates=True"
@@ -72,7 +76,10 @@ def health_check():
     return "Stream Bot is active and running 24/7 on Render!"
 
 def start_keep_alive():
-    web_server.run(host="0.0.0.0", port=PORT)
+    try:
+        web_server.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
+    except Exception:
+        logger.exception("Flask keep-alive server failed.")
 
 def sanitize_filename(name: str) -> str:
     name = unquote(name)
@@ -232,7 +239,7 @@ def execute_resilient_stream(source_url: str, filename: str, total_size: int, tr
 async def log_incoming_message(_, message: Message):
     logger.info(f"Received message: {message.text}")
 
-@bot.on_message(filters.command("start"))
+@bot.on_message(filters.regex(r"^/start(?:@\\w+)?$", re.IGNORECASE))
 async def handle_start(_, message: Message):
     await message.reply_text(
         "⚡ **Production Multi-Host Streamer**\n\n"
@@ -243,7 +250,7 @@ async def handle_start(_, message: Message):
         "Send \x60/help\x60 for usage."
     )
 
-@bot.on_message(filters.command("help"))
+@bot.on_message(filters.regex(r"^/help(?:@\\w+)?$", re.IGNORECASE))
 async def handle_help(_, message: Message):
     await message.reply_text(
         "📖 **Usage Guide:**\n\n"
@@ -251,7 +258,7 @@ async def handle_help(_, message: Message):
         "The bot will stream the file directly without filling Render's disk."
     )
 
-@bot.on_message(filters.command("uphoster"))
+@bot.on_message(filters.regex(r"^/uphoster(?:@\\w+)?(?:\\s+.+)?$", re.IGNORECASE))
 async def handle_uphoster(_, message: Message):
     parts = message.text.split(maxsplit=1)
     if len(parts) < 2:
@@ -339,21 +346,40 @@ async def handle_uphoster(_, message: Message):
 
 if __name__ == "__main__":
     logger.info("=== movie-ai-bot production launcher ===")
+    logger.info("Python process starting; PORT=%s", PORT)
     threading.Thread(target=start_keep_alive, daemon=True, name="flask-health").start()
+
     retry_delay = 5
     while True:
+        started = False
         try:
             logger.info("Purging any conflicting Telegram webhook before polling...")
             purge_webhook()
-            logger.info("Starting Pyrogram bot client...")
-            bot.run()
-            logger.warning("Pyrogram stopped; restarting in %ss.", retry_delay)
+            logger.info("Starting Pyrogram client...")
+            bot.start()
+            started = True
+
+            me = bot.get_me()
+            logger.info(
+                "TELEGRAM CONNECTED: id=%s username=@%s name=%s",
+                me.id,
+                me.username or "none",
+                me.first_name or "none",
+            )
+            logger.info("READY: waiting for Telegram updates. Test with /start")
+
+            idle()
+
+            logger.warning("Pyrogram idle() returned; restarting.")
         except Exception:
-            logger.exception("Pyrogram startup/runtime exception; process will stay alive.")
+            logger.exception("Telegram startup/runtime failure; process will stay alive.")
         finally:
-            try:
-                bot.stop()
-            except Exception:
-                pass
+            if started:
+                try:
+                    bot.stop()
+                except Exception:
+                    logger.exception("Error while stopping Pyrogram client.")
+
+        logger.info("Restarting Telegram client in %ss...", retry_delay)
         time.sleep(retry_delay)
         retry_delay = min(retry_delay * 2, 60)
