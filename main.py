@@ -18,7 +18,7 @@ import logging
 from urllib.parse import unquote, quote
 import requests
 from flask import Flask
-from pyrogram import Client, filters
+from pyrogram import Client, filters, idle
 from pyrogram.types import Message
 
 logging.basicConfig(
@@ -354,6 +354,28 @@ async def main():
             await bot.stop()
         except Exception:
             pass
+
+async def main():
+    threading.Thread(target=start_keep_alive, daemon=True).start()
+
+    logger.info("Initializing Telegram Bot...")
+    await bot.start()
+
+    try:
+        logger.info("Clearing any old webhooks...")
+        response = requests.get(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook?drop_pending_updates=True",
+            timeout=10
+        )
+        logger.info(f"Webhook clear response: {response.text}")
+    except Exception as e:
+        logger.warning(f"Could not clear webhook via API: {e}")
+
+    bot_info = await bot.get_me()
+    logger.info(f"SUCCESS: Bot is online and listening as @{bot_info.username}")
+
+    await idle()
+    await bot.stop()
 
 if __name__ == "__main__":
     asyncio.run(main())
