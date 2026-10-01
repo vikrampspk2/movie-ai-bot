@@ -27,16 +27,31 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ProdStreamBot")
 
-API_ID = int(os.environ.get("API_ID", 0))
-API_HASH = os.environ.get("API_HASH", "")
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+def clean_env(name: str) -> str:
+    value = os.environ.get(name, "")
+    return value.strip().strip('"').strip("'").strip()
+
+API_ID_RAW = clean_env("API_ID")
+API_HASH = clean_env("API_HASH")
+BOT_TOKEN = clean_env("BOT_TOKEN")
+
+try:
+    API_ID = int(API_ID_RAW)
+except (TypeError, ValueError):
+    logger.exception("Invalid API_ID environment variable. Expected an integer.")
+    raise SystemExit(1)
+
+if not API_HASH or not BOT_TOKEN:
+    logger.error("Missing API_HASH or BOT_TOKEN environment variable.")
+    raise SystemExit(1)
 PORT = int(os.environ.get("PORT", 8080))
 
 bot = Client(
-    "render_prod_stream_bot",
+    "render_prod_stream_bot_clean",
     api_id=API_ID,
     api_hash=API_HASH,
-    bot_token=BOT_TOKEN
+    bot_token=BOT_TOKEN,
+    workdir="/tmp"
 )
 
 web_server = Flask(__name__)
@@ -202,6 +217,10 @@ def execute_resilient_stream(source_url: str, filename: str, total_size: int, tr
 
     return results if download_success else {}
 
+@bot.on_message()
+async def log_incoming_message(_, message: Message):
+    logger.info(f"Received message: {message.text}")
+
 @bot.on_message(filters.command("start"))
 async def handle_start(_, message: Message):
     await message.reply_text(
@@ -309,4 +328,9 @@ async def handle_uphoster(_, message: Message):
 
 if __name__ == "__main__":
     threading.Thread(target=start_keep_alive, daemon=True).start()
-    bot.run()
+    logger.info("Starting Pyrogram client...")
+    try:
+        bot.run()
+    except Exception:
+        logger.exception("Pyrogram client initialization/runtime failed.")
+        raise
