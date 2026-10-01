@@ -378,4 +378,21 @@ async def main():
     await bot.stop()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        logger.info("Purging any conflicting webhooks from Telegram...")
+        response = requests.get(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook?drop_pending_updates=True",
+            timeout=10
+        )
+        logger.info(f"Webhook purge response: {response.text}")
+    except Exception as e:
+        logger.warning(f"Webhook purge warning: {e}")
+
+    threading.Thread(target=start_keep_alive, daemon=True).start()
+
+    logger.info("Starting Pyrogram bot client...")
+    try:
+        bot.run()
+    except Exception:
+        logger.exception("Pyrogram bot client crashed during startup/runtime.")
+        raise
